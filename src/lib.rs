@@ -1,6 +1,7 @@
 pub mod claude;
 pub mod message_log;
 pub mod openrouter;
+pub mod sandbox;
 pub mod session;
 pub mod tools;
 

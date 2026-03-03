@@ -25,6 +25,7 @@ pub struct Claude {
     extra_args: Vec<String>,
     mcp_config: Option<String>,
     env_removes: Vec<String>,
+    command_prefix: Vec<String>,
 }
 
 impl Claude {
@@ -56,6 +57,7 @@ impl Claude {
             extra_args: Vec::new(),
             mcp_config: None,
             env_removes: Vec::new(),
+            command_prefix: Vec::new(),
         }
     }
 
@@ -149,8 +151,23 @@ impl Claude {
         self
     }
 
-    fn build_command(&self, prompt: &str) -> Command {
-        let mut cmd = Command::new(&self.binary);
+    /// Prepend a command prefix (e.g. bwrap sandbox args) before the claude binary.
+    pub fn command_prefix(mut self, prefix: Vec<String>) -> Self {
+        self.command_prefix = prefix;
+        self
+    }
+
+    pub(crate) fn build_command(&self, prompt: &str) -> Command {
+        let mut cmd = if self.command_prefix.is_empty() {
+            Command::new(&self.binary)
+        } else {
+            let mut c = Command::new(&self.command_prefix[0]);
+            for arg in &self.command_prefix[1..] {
+                c.arg(arg);
+            }
+            c.arg(&self.binary);
+            c
+        };
         cmd.arg("-p");
         if !self.stdin_prompt {
             cmd.arg(prompt);
@@ -419,5 +436,28 @@ mod tests {
         let json = r#"{"result": "ok", "cost_usd": 0.05}"#;
         let output = parse_output(json.as_bytes());
         assert_eq!(output.cost_usd, Some(0.05));
+    }
+
+    #[test]
+    fn build_command_without_prefix() {
+        let claude = Claude::with_binary(PathBuf::from("/usr/bin/claude"));
+        let cmd = claude.build_command("hello");
+        let prog = cmd.as_std().get_program().to_string_lossy().to_string();
+        assert_eq!(prog, "/usr/bin/claude");
+        let args: Vec<_> = cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        assert!(args.contains(&"hello".to_string()));
+    }
+
+    #[test]
+    fn build_command_with_prefix() {
+        let claude = Claude::with_binary(PathBuf::from("/usr/bin/claude"))
+            .command_prefix(vec!["bwrap".into(), "--ro-bind".into(), "/".into(), "/".into(), "--".into()]);
+        let cmd = claude.build_command("hello");
+        let prog = cmd.as_std().get_program().to_string_lossy().to_string();
+        assert_eq!(prog, "bwrap");
+        let args: Vec<_> = cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        assert_eq!(args[0], "--ro-bind");
+        assert_eq!(args[3], "--");
+        assert_eq!(args[4], "/usr/bin/claude");
     }
 }

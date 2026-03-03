@@ -52,6 +52,16 @@ impl ToolSet {
             .add(bash::BashTool::new())
     }
 
+    /// Standard set with Bash sandboxed via a command prefix (e.g. bwrap).
+    pub fn standard_sandboxed(command_prefix: Vec<String>) -> Self {
+        Self::new()
+            .add(read::ReadTool)
+            .add(write::WriteTool)
+            .add(glob::GlobTool)
+            .add(grep::GrepTool)
+            .add(bash::BashTool::new().with_command_prefix(command_prefix))
+    }
+
     pub fn definitions(&self) -> Vec<Tool> {
         self.tools.iter().map(|t| t.definition()).collect()
     }
@@ -74,5 +84,39 @@ impl ToolSet {
 
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool_names(set: &ToolSet) -> Vec<String> {
+        set.definitions().iter().map(|d| d.name.clone()).collect()
+    }
+
+    #[test]
+    fn standard_has_five_tools() {
+        let names = tool_names(&ToolSet::standard());
+        assert_eq!(names, vec!["Read", "Write", "Glob", "Grep", "Bash"]);
+    }
+
+    #[test]
+    fn standard_sandboxed_has_same_tools() {
+        let names = tool_names(&ToolSet::standard_sandboxed(vec!["bwrap".into(), "--".into()]));
+        assert_eq!(names, vec!["Read", "Write", "Glob", "Grep", "Bash"]);
+    }
+
+    #[tokio::test]
+    async fn sandboxed_bash_uses_prefix() {
+        // "env --" is a transparent wrapper that proves the prefix is wired through
+        let set = ToolSet::standard_sandboxed(vec!["env".into(), "--".into()]);
+        let call = ToolCall {
+            id: "1".into(),
+            name: "Bash".into(),
+            arguments: r#"{"command": "echo works"}"#.into(),
+        };
+        let result = set.execute(&call).await;
+        assert_eq!(result.trim(), "works");
     }
 }
