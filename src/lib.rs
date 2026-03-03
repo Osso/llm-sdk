@@ -1,8 +1,10 @@
 pub mod claude;
+pub mod message_log;
 pub mod openrouter;
 pub mod session;
 pub mod tools;
 
+pub use message_log::{ChatMessage, MessageLog, ToolCallRecord};
 pub use session::{LogEntry, LogUsage};
 
 /// Backend trait for language model completions.

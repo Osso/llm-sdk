@@ -1,4 +1,5 @@
 use crate::claude::Claude;
+use crate::message_log::MessageLog;
 use crate::{Backend, Error, Output};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -34,6 +35,24 @@ impl SessionStore {
         Self {
             inner: Arc::new(Mutex::new(StoreInner { data_dir, sessions })),
         }
+    }
+
+    /// Expose the data directory (e.g. for message log construction).
+    pub fn data_dir(&self) -> PathBuf {
+        self.inner.lock().unwrap().data_dir.clone()
+    }
+
+    /// Load (or create empty) a `MessageLog` for the given key.
+    pub fn message_log(&self, key: &str) -> MessageLog {
+        let data_dir = self.data_dir();
+        MessageLog::load(&data_dir, key)
+    }
+
+    /// Delete the message log file for the given key, if it exists.
+    pub fn remove_message_log(&self, key: &str) {
+        let data_dir = self.data_dir();
+        let path = data_dir.join("message_logs").join(format!("{key}.json"));
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Remove a session key, forcing a fresh session on next `session()` call.

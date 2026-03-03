@@ -1,3 +1,5 @@
+use crate::message_log::{ChatMessage, MessageLog, ToolCallRecord};
+use crate::session::now_utc;
 use crate::tools::{ToolCall, ToolSet};
 use crate::{Backend, Error, Output, TokenUsage};
 use serde::{Deserialize, Serialize};
@@ -323,6 +325,85 @@ impl Backend for OpenRouter {
         }
 
         Err(Error::MaxTurns(self.max_turns))
+    }
+}
+
+// --- ChatMessage <-> Message conversions ---
+
+fn chat_message_to_api(msg: &ChatMessage) -> Message {
+    Message {
+        role: msg.role.clone(),
+        content: msg.content.clone(),
+        tool_calls: msg.tool_calls.as_ref().map(|tcs| {
+            tcs.iter()
+                .map(|tc| ApiToolCall {
+                    id: tc.id.clone(),
+                    call_type: "function".into(),
+                    function: ApiFunctionCall { name: tc.name.clone(), arguments: tc.arguments.clone() },
+                })
+                .collect()
+        }),
+        tool_call_id: msg.tool_call_id.clone(),
+    }
+}
+
+fn api_tool_call_to_record(tc: &ApiToolCall) -> ToolCallRecord {
+    ToolCallRecord { id: tc.id.clone(), name: tc.function.name.clone(), arguments: tc.function.arguments.clone() }
+}
+
+fn push_user_message(log: &mut MessageLog, prompt: &str) {
+    log.push(ChatMessage { role: "user".into(), content: Some(prompt.into()), tool_calls: None, tool_call_id: None, timestamp: now_utc() });
+}
+
+fn push_final_assistant(log: &mut MessageLog, text: &str) {
+    log.push(ChatMessage { role: "assistant".into(), content: Some(text.into()), tool_calls: None, tool_call_id: None, timestamp: now_utc() });
+}
+
+fn push_assistant_tool_calls(log: &mut MessageLog, tool_calls: &[ApiToolCall], content: Option<String>) {
+    let records: Vec<ToolCallRecord> = tool_calls.iter().map(api_tool_call_to_record).collect();
+    log.push(ChatMessage { role: "assistant".into(), content, tool_calls: Some(records), tool_call_id: None, timestamp: now_utc() });
+}
+
+fn push_tool_result(log: &mut MessageLog, id: &str, result: String) {
+    log.push(ChatMessage { role: "tool".into(), content: Some(result), tool_calls: None, tool_call_id: Some(id.into()), timestamp: now_utc() });
+}
+
+// --- complete_chat: agentic loop with MessageLog persistence ---
+
+impl OpenRouter {
+    /// Run the agentic completion loop, persisting every message to `log`.
+    pub async fn complete_chat(&self, log: &mut MessageLog, prompt: &str) -> Result<Output, Error> {
+        push_user_message(log, prompt);
+        let api_tools = self.tool_set.as_ref().map(tool_defs_to_api);
+        let mut total_usage = TokenUsage::default();
+
+        for _turn in 0..self.max_turns {
+            let messages: Vec<Message> = log.messages().iter().map(chat_message_to_api).collect();
+            let (resp, usage) = self.call_api(&messages, &api_tools).await?;
+            total_usage.accumulate(&usage);
+            let choice = resp.choices.into_iter().next()
+                .ok_or_else(|| Error::Parse("no choices in response".into()))?;
+            let tool_calls = choice.message.tool_calls.unwrap_or_default();
+            if tool_calls.is_empty() {
+                let text = choice.message.content.unwrap_or_default();
+                push_final_assistant(log, &text);
+                return Ok(Output { text, usage: Some(total_usage), session_id: None, cost_usd: None });
+            }
+            if let Some(ref ts) = self.tool_set {
+                self.run_tool_turn(log, tool_calls, choice.message.content, ts).await;
+            }
+        }
+        Err(Error::MaxTurns(self.max_turns))
+    }
+
+    async fn run_tool_turn(&self, log: &mut MessageLog, tool_calls: Vec<ApiToolCall>, content: Option<String>, tool_set: &ToolSet) {
+        push_assistant_tool_calls(log, &tool_calls, content);
+        for tc in &tool_calls {
+            let call = ToolCall { id: tc.id.clone(), name: tc.function.name.clone(), arguments: tc.function.arguments.clone() };
+            let result = tool_set.execute(&call).await;
+            tracing::debug!(tool = %call.name, "tool result: {} bytes", result.len());
+            push_tool_result(log, &tc.id, result);
+        }
     }
 }
 
