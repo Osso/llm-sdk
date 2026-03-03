@@ -2,6 +2,9 @@
 name = "llm-sdk"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "LLM SDK for Claude CLI and OpenRouter API"
+repository = "https://github.com/Osso/llm-sdk"
 
 [dependencies]
 async-trait = "0.1"
