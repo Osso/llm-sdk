@@ -35,6 +35,14 @@ impl SessionStore {
         }
     }
 
+    /// Remove a session key, forcing a fresh session on next `session()` call.
+    pub fn remove(&self, key: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.sessions.remove(key).is_some() {
+            write_sessions(&inner.data_dir, &inner.sessions);
+        }
+    }
+
     /// Get or create a session for the given key.
     pub fn session(&self, key: &str) -> Session {
         let inner = self.inner.lock().unwrap();
