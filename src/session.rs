@@ -1,7 +1,8 @@
 use crate::claude::Claude;
 use crate::{Backend, Error, Output};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// Directory-backed session ID store.
@@ -81,8 +82,15 @@ impl Session {
         &self.session_id
     }
 
+    /// Return the data directory for this session's store.
+    pub fn data_dir(&self) -> PathBuf {
+        self.store.lock().unwrap().data_dir.clone()
+    }
+
     /// Reset to a new session (new UUID, not yet created).
     pub fn reset(&mut self) {
+        let data_dir = self.data_dir();
+        append_log(&data_dir, &self.key, &LogEntry::SessionReset);
         self.session_id = new_uuid();
         self.created = false;
         self.persist();
@@ -116,6 +124,31 @@ impl Session {
         let output = claude.complete(prompt).await?;
         self.created = true;
         self.persist();
+
+        let data_dir = self.data_dir();
+        append_log(
+            &data_dir,
+            &self.key,
+            &LogEntry::User {
+                text: prompt.to_string(),
+                timestamp: now_utc(),
+            },
+        );
+        append_log(
+            &data_dir,
+            &self.key,
+            &LogEntry::Assistant {
+                text: output.text.clone(),
+                timestamp: now_utc(),
+                usage: output.usage.as_ref().map(|u| LogUsage {
+                    input: u.input_tokens,
+                    output: u.output_tokens,
+                    cache_read: u.cache_read_input_tokens,
+                    cache_creation: u.cache_creation_input_tokens,
+                }),
+            },
+        );
+
         Ok(output)
     }
 
@@ -125,6 +158,82 @@ impl Session {
             .sessions
             .insert(self.key.clone(), self.session_id.clone());
         write_sessions(&inner.data_dir, &inner.sessions);
+    }
+}
+
+/// A single entry in the per-key JSONL conversation log.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+pub enum LogEntry {
+    #[serde(rename = "user")]
+    User { text: String, timestamp: String },
+    #[serde(rename = "assistant")]
+    Assistant {
+        text: String,
+        timestamp: String,
+        usage: Option<LogUsage>,
+    },
+    #[serde(rename = "session_reset")]
+    SessionReset,
+}
+
+/// Token usage recorded in the log.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct LogUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
+}
+
+/// Return the current UTC time as an ISO-8601 string (no external deps).
+pub fn now_utc() -> String {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = d.as_secs();
+    let days = secs / 86400;
+    let time_secs = secs % 86400;
+    let hours = time_secs / 3600;
+    let minutes = (time_secs % 3600) / 60;
+    let seconds = time_secs % 60;
+    let (y, m, day) = civil_from_days(days as i64);
+    format!("{y:04}-{m:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
+}
+
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    // Howard Hinnant's algorithm
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m, d)
+}
+
+/// Append a `LogEntry` as a JSONL line to `{data_dir}/logs/{key}.jsonl`.
+pub fn append_log(data_dir: &Path, key: &str, entry: &LogEntry) {
+    let logs_dir = data_dir.join("logs");
+    if std::fs::create_dir_all(&logs_dir).is_err() {
+        return;
+    }
+    let path = logs_dir.join(format!("{key}.jsonl"));
+    let mut file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    if let Ok(json) = serde_json::to_string(entry) {
+        use std::io::Write;
+        let _ = writeln!(file, "{json}");
     }
 }
 
@@ -286,5 +395,47 @@ mod tests {
         assert!(content.contains("architect"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn now_utc_format() {
+        let ts = now_utc();
+        // Basic ISO-8601 shape: 2026-03-03T12:00:00Z
+        assert_eq!(ts.len(), 20);
+        assert_eq!(&ts[4..5], "-");
+        assert_eq!(&ts[7..8], "-");
+        assert_eq!(&ts[10..11], "T");
+        assert_eq!(&ts[19..20], "Z");
+    }
+
+    #[test]
+    fn append_log_creates_file() {
+        let dir = std::env::temp_dir().join("llm-sdk-test-log");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        append_log(
+            &dir,
+            "mykey",
+            &LogEntry::User {
+                text: "hello".into(),
+                timestamp: now_utc(),
+            },
+        );
+
+        let log_path = dir.join("logs/mykey.jsonl");
+        assert!(log_path.exists());
+        let content = std::fs::read_to_string(&log_path).unwrap();
+        assert!(content.contains("\"type\":\"user\""));
+        assert!(content.contains("hello"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_entry_session_reset_serializes() {
+        let entry = LogEntry::SessionReset;
+        let json = serde_json::to_string(&entry).unwrap();
+        assert_eq!(json, r#"{"type":"session_reset"}"#);
     }
 }

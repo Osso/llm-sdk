@@ -1,6 +1,8 @@
 pub mod claude;
 pub mod session;
 
+pub use session::{LogEntry, LogUsage};
+
 /// Backend trait for language model completions.
 #[async_trait::async_trait]
 pub trait Backend: Send + Sync {
