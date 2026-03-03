@@ -66,6 +66,12 @@ impl ToolSet {
         format!("Unknown tool: {}", call.name)
     }
 
+    /// Merge another ToolSet into this one (consumes both).
+    pub fn merge(mut self, other: ToolSet) -> Self {
+        self.tools.extend(other.tools);
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }
