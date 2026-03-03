@@ -1,4 +1,5 @@
 pub mod claude;
+pub mod session;
 
 /// Backend trait for language model completions.
 #[async_trait::async_trait]

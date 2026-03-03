@@ -5,6 +5,7 @@ use std::time::Duration;
 use tokio::process::Command;
 
 /// Claude CLI backend with builder-pattern configuration.
+#[derive(Clone)]
 pub struct Claude {
     binary: PathBuf,
     model: Option<String>,

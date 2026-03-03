@@ -1,0 +1,282 @@
+use crate::claude::Claude;
+use crate::{Backend, Error, Output};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+/// Directory-backed session ID store.
+///
+/// Manages `sessions.json` — a flat map of key → session_id.
+/// Thread-safe via `Arc<Mutex<>>`.
+#[derive(Clone)]
+pub struct SessionStore {
+    inner: Arc<Mutex<StoreInner>>,
+}
+
+struct StoreInner {
+    data_dir: PathBuf,
+    sessions: HashMap<String, String>,
+}
+
+impl SessionStore {
+    /// Create a store at `~/.local/share/{app}/{project}/`.
+    pub fn new(app: &str, project: &str) -> Self {
+        let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        let data_dir = base.join(app).join(project);
+        Self::load(data_dir)
+    }
+
+    /// Create a store at an explicit directory path.
+    pub fn load(data_dir: PathBuf) -> Self {
+        let _ = std::fs::create_dir_all(&data_dir);
+        let sessions = read_sessions(&data_dir);
+        Self {
+            inner: Arc::new(Mutex::new(StoreInner { data_dir, sessions })),
+        }
+    }
+
+    /// Get or create a session for the given key.
+    pub fn session(&self, key: &str) -> Session {
+        let inner = self.inner.lock().unwrap();
+        let (session_id, created) = match inner.sessions.get(key) {
+            Some(id) => (id.clone(), true),
+            None => (new_uuid(), false),
+        };
+        Session {
+            key: key.to_string(),
+            session_id,
+            created,
+            system_prompt: None,
+            store: self.inner.clone(),
+        }
+    }
+}
+
+/// One conversation's lifecycle — handles resume, expiry, and persistence.
+pub struct Session {
+    key: String,
+    session_id: String,
+    created: bool,
+    system_prompt: Option<String>,
+    store: Arc<Mutex<StoreInner>>,
+}
+
+impl Session {
+    /// Set the system prompt for fresh sessions.
+    pub fn system_prompt(mut self, sp: impl Into<String>) -> Self {
+        self.system_prompt = Some(sp.into());
+        self
+    }
+
+    /// Current session ID.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Reset to a new session (new UUID, not yet created).
+    pub fn reset(&mut self) {
+        self.session_id = new_uuid();
+        self.created = false;
+        self.persist();
+    }
+
+    /// Run a completion, handling resume and session expiry transparently.
+    pub async fn complete(&mut self, base: &Claude, prompt: &str) -> Result<Output, Error> {
+        let result = self.try_complete(base, prompt).await;
+        match result {
+            Err(Error::SessionExpired) if self.created => {
+                tracing::info!(key = %self.key, "session expired, starting fresh");
+                self.session_id = new_uuid();
+                self.created = false;
+                self.persist();
+                self.try_complete(base, prompt).await
+            }
+            other => other,
+        }
+    }
+
+    async fn try_complete(&mut self, base: &Claude, prompt: &str) -> Result<Output, Error> {
+        let claude = if self.created {
+            base.clone().resume(&self.session_id)
+        } else {
+            let mut c = base.clone().session_id(&self.session_id);
+            if let Some(ref sp) = self.system_prompt {
+                c = c.system_prompt(sp);
+            }
+            c
+        };
+        let output = claude.complete(prompt).await?;
+        self.created = true;
+        self.persist();
+        Ok(output)
+    }
+
+    fn persist(&self) {
+        let mut inner = self.store.lock().unwrap();
+        inner
+            .sessions
+            .insert(self.key.clone(), self.session_id.clone());
+        write_sessions(&inner.data_dir, &inner.sessions);
+    }
+}
+
+fn sessions_path(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("sessions.json")
+}
+
+fn read_sessions(data_dir: &std::path::Path) -> HashMap<String, String> {
+    let path = sessions_path(data_dir);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return HashMap::new();
+    };
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return HashMap::new();
+    };
+    let Some(obj) = val.as_object() else {
+        return HashMap::new();
+    };
+    obj.iter()
+        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+        .collect()
+}
+
+fn write_sessions(data_dir: &std::path::Path, sessions: &HashMap<String, String>) {
+    let map: serde_json::Map<String, serde_json::Value> = sessions
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+        .collect();
+    let json = serde_json::to_string_pretty(&map).unwrap_or_default();
+    let path = sessions_path(data_dir);
+    let _ = std::fs::write(&path, json);
+}
+
+/// Generate a hash-based UUIDv4 (no uuid crate dependency).
+pub fn new_uuid() -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::time::SystemTime;
+
+    let mut h1 = DefaultHasher::new();
+    SystemTime::now().hash(&mut h1);
+    std::process::id().hash(&mut h1);
+    let a = h1.finish();
+
+    let mut h2 = DefaultHasher::new();
+    a.hash(&mut h2);
+    let b = h2.finish();
+
+    // UUIDv4: version nibble = 4, variant bits = 10xx
+    format!(
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        (a >> 32) as u32,
+        (a >> 16) as u16,
+        a as u16 & 0x0FFF,
+        (b >> 48) as u16 & 0x3FFF | 0x8000,
+        b & 0xFFFF_FFFF_FFFF,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn uuid_format() {
+        let id = new_uuid();
+        assert_eq!(id.len(), 36);
+        assert_eq!(&id[14..15], "4"); // version nibble
+        let variant = u8::from_str_radix(&id[19..20], 16).unwrap();
+        assert!((8..=11).contains(&variant)); // variant 10xx
+    }
+
+    #[test]
+    fn uuid_uniqueness() {
+        let a = new_uuid();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let b = new_uuid();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn store_roundtrip() {
+        let dir = std::env::temp_dir().join("llm-sdk-test-store");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = SessionStore::load(dir.clone());
+        let mut session = store.session("test-key");
+        assert!(!session.created);
+
+        // Simulate persist
+        session.created = true;
+        session.persist();
+
+        // Reload from disk
+        let store2 = SessionStore::load(dir.clone());
+        let session2 = store2.session("test-key");
+        assert!(session2.created);
+        assert_eq!(session2.session_id(), session.session_id());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_empty_file() {
+        let dir = std::env::temp_dir().join("llm-sdk-test-empty");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("sessions.json"), "").unwrap();
+        let sessions = read_sessions(&dir.to_path_buf());
+        assert!(sessions.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_new_resolves_path() {
+        let store = SessionStore::new("llm-sdk-test-app", "test-project");
+        let inner = store.inner.lock().unwrap();
+        let path = inner.data_dir.to_string_lossy();
+        assert!(path.contains("llm-sdk-test-app"));
+        assert!(path.contains("test-project"));
+        let _ = std::fs::remove_dir_all(&inner.data_dir);
+    }
+
+    #[test]
+    fn session_reset() {
+        let dir = std::env::temp_dir().join("llm-sdk-test-reset");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = SessionStore::load(dir.clone());
+        let mut session = store.session("key");
+        let original_id = session.session_id().to_string();
+
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        session.reset();
+        assert_ne!(session.session_id(), original_id);
+        assert!(!session.created);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multiple_keys() {
+        let dir = std::env::temp_dir().join("llm-sdk-test-multi");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = SessionStore::load(dir.clone());
+        let mut s1 = store.session("dev-0");
+        let mut s2 = store.session("architect");
+        s1.created = true;
+        s1.persist();
+        s2.created = true;
+        s2.persist();
+
+        // Verify both persisted
+        let path = dir.join("sessions.json");
+        assert!(Path::new(&path).exists());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("dev-0"));
+        assert!(content.contains("architect"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
