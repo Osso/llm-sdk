@@ -23,6 +23,7 @@ pub struct Claude {
     verbose: bool,
     stdin_prompt: bool,
     extra_args: Vec<String>,
+    mcp_config: Option<String>,
     env_removes: Vec<String>,
 }
 
@@ -53,6 +54,7 @@ impl Claude {
             verbose: false,
             stdin_prompt: false,
             extra_args: Vec::new(),
+            mcp_config: None,
             env_removes: Vec::new(),
         }
     }
@@ -137,6 +139,11 @@ impl Claude {
         self
     }
 
+    pub fn mcp_config(mut self, config: impl Into<String>) -> Self {
+        self.mcp_config = Some(config.into());
+        self
+    }
+
     pub fn env_remove(mut self, key: impl Into<String>) -> Self {
         self.env_removes.push(key.into());
         self
@@ -187,6 +194,9 @@ impl Claude {
         }
         if self.verbose {
             cmd.arg("--verbose");
+        }
+        if let Some(ref cfg) = self.mcp_config {
+            cmd.arg("--mcp-config").arg(cfg);
         }
         for arg in &self.extra_args {
             cmd.arg(arg);
