@@ -1,0 +1,427 @@
+use crate::tools::{ToolCall, ToolSet};
+use crate::{Backend, Error, Output, TokenUsage};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+pub struct OpenRouter {
+    client: reqwest::Client,
+    base_url: String,
+    api_key: String,
+    model: String,
+    system_prompt: Option<String>,
+    tool_set: Option<ToolSet>,
+    timeout: Option<Duration>,
+    max_turns: u32,
+    site_url: Option<String>,
+    site_name: Option<String>,
+}
+
+impl OpenRouter {
+    pub fn new(model: impl Into<String>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base_url: DEFAULT_BASE_URL.into(),
+            api_key: String::new(),
+            model: model.into(),
+            system_prompt: None,
+            tool_set: None,
+            timeout: None,
+            max_turns: 20,
+            site_url: None,
+            site_name: None,
+        }
+    }
+
+    pub fn base_url(mut self, url: impl Into<String>) -> Self {
+        self.base_url = url.into();
+        self
+    }
+
+    pub fn api_key(mut self, key: impl Into<String>) -> Self {
+        self.api_key = key.into();
+        self
+    }
+
+    pub fn api_key_env(mut self, var: &str) -> Self {
+        self.api_key = std::env::var(var).unwrap_or_default();
+        self
+    }
+
+    pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = Some(prompt.into());
+        self
+    }
+
+    pub fn tools(mut self, tool_set: ToolSet) -> Self {
+        self.tool_set = Some(tool_set);
+        self
+    }
+
+    pub fn timeout(mut self, dur: Duration) -> Self {
+        self.timeout = Some(dur);
+        self
+    }
+
+    pub fn max_turns(mut self, n: u32) -> Self {
+        self.max_turns = n;
+        self
+    }
+
+    pub fn site_url(mut self, url: impl Into<String>) -> Self {
+        self.site_url = Some(url.into());
+        self
+    }
+
+    pub fn site_name(mut self, name: impl Into<String>) -> Self {
+        self.site_name = Some(name.into());
+        self
+    }
+}
+
+// --- API request/response types (private) ---
+
+#[derive(Serialize)]
+struct ApiRequest {
+    model: String,
+    messages: Vec<Message>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ApiToolDef>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct Message {
+    role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ApiToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct ApiToolDef {
+    #[serde(rename = "type")]
+    tool_type: String,
+    function: ApiFunction,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ApiToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    call_type: String,
+    function: ApiFunctionCall,
+}
+
+#[derive(Serialize, Clone)]
+struct ApiFunction {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ApiFunctionCall {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Deserialize)]
+struct ApiResponse {
+    choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<ApiUsage>,
+}
+
+#[derive(Deserialize)]
+struct Choice {
+    message: MessageResponse,
+}
+
+#[derive(Deserialize)]
+struct MessageResponse {
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ApiToolCall>>,
+}
+
+#[derive(Deserialize)]
+struct ApiUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+}
+
+// --- Convert tool definitions for API ---
+
+fn tool_defs_to_api(tool_set: &ToolSet) -> Vec<ApiToolDef> {
+    tool_set
+        .definitions()
+        .into_iter()
+        .map(|t| ApiToolDef {
+            tool_type: "function".into(),
+            function: ApiFunction {
+                name: t.name,
+                description: t.description,
+                parameters: t.parameters,
+            },
+        })
+        .collect()
+}
+
+fn api_usage_to_token_usage(u: &ApiUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: u.prompt_tokens,
+        output_tokens: u.completion_tokens,
+        ..Default::default()
+    }
+}
+
+// --- HTTP call ---
+
+impl OpenRouter {
+    fn build_request(&self, messages: &[Message], tools: &Option<Vec<ApiToolDef>>) -> reqwest::RequestBuilder {
+        let body = ApiRequest {
+            model: self.model.clone(),
+            messages: messages.to_vec(),
+            tools: tools.as_ref().and_then(|t| {
+                if t.is_empty() { None } else { Some(t.clone()) }
+            }),
+        };
+        let mut req = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&body);
+        if let Some(ref url) = self.site_url {
+            req = req.header("HTTP-Referer", url);
+        }
+        if let Some(ref name) = self.site_name {
+            req = req.header("X-Title", name);
+        }
+        req
+    }
+
+    async fn send_request(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response, Error> {
+        let future = req.send();
+        let resp = match self.timeout {
+            Some(dur) => tokio::time::timeout(dur, future)
+                .await
+                .map_err(|_| Error::Timeout)?
+                .map_err(|e| Error::Api { status: 0, body: e.to_string() })?,
+            None => future.await.map_err(|e| Error::Api { status: 0, body: e.to_string() })?,
+        };
+        let status = resp.status().as_u16();
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Api { status, body });
+        }
+        Ok(resp)
+    }
+
+    async fn call_api(
+        &self,
+        messages: &[Message],
+        tools: &Option<Vec<ApiToolDef>>,
+    ) -> Result<(ApiResponse, TokenUsage), Error> {
+        let req = self.build_request(messages, tools);
+        let resp = self.send_request(req).await?;
+        let api_resp: ApiResponse = resp.json().await.map_err(|e| Error::Parse(e.to_string()))?;
+        let usage = api_resp
+            .usage
+            .as_ref()
+            .map(api_usage_to_token_usage)
+            .unwrap_or_default();
+        Ok((api_resp, usage))
+    }
+}
+
+// --- Agent loop ---
+
+fn build_messages(system_prompt: Option<&str>, user_prompt: &str) -> Vec<Message> {
+    let mut messages = Vec::new();
+    if let Some(sp) = system_prompt {
+        messages.push(Message {
+            role: "system".into(),
+            content: Some(sp.into()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+    messages.push(Message {
+        role: "user".into(),
+        content: Some(user_prompt.into()),
+        tool_calls: None,
+        tool_call_id: None,
+    });
+    messages
+}
+
+async fn append_tool_results(
+    messages: &mut Vec<Message>,
+    tool_calls: Vec<ApiToolCall>,
+    assistant_content: Option<String>,
+    tool_set: &ToolSet,
+) {
+    messages.push(Message {
+        role: "assistant".into(),
+        content: assistant_content,
+        tool_calls: Some(tool_calls.clone()),
+        tool_call_id: None,
+    });
+    for tc in &tool_calls {
+        let call = ToolCall {
+            id: tc.id.clone(),
+            name: tc.function.name.clone(),
+            arguments: tc.function.arguments.clone(),
+        };
+        let result = tool_set.execute(&call).await;
+        tracing::debug!(tool = %call.name, "tool result: {} bytes", result.len());
+        messages.push(Message {
+            role: "tool".into(),
+            content: Some(result),
+            tool_calls: None,
+            tool_call_id: Some(tc.id.clone()),
+        });
+    }
+}
+
+#[async_trait::async_trait]
+impl Backend for OpenRouter {
+    async fn complete(&self, prompt: &str) -> Result<Output, Error> {
+        let mut messages = build_messages(self.system_prompt.as_deref(), prompt);
+        let api_tools = self.tool_set.as_ref().map(tool_defs_to_api);
+        let mut total_usage = TokenUsage::default();
+
+        for _turn in 0..self.max_turns {
+            let (resp, usage) = self.call_api(&messages, &api_tools).await?;
+            total_usage.accumulate(&usage);
+
+            let choice = resp
+                .choices
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::Parse("no choices in response".into()))?;
+
+            let tool_calls = choice.message.tool_calls.unwrap_or_default();
+            if tool_calls.is_empty() {
+                return Ok(Output {
+                    text: choice.message.content.unwrap_or_default(),
+                    usage: Some(total_usage),
+                    session_id: None,
+                    cost_usd: None,
+                });
+            }
+
+            if let Some(ref ts) = self.tool_set {
+                append_tool_results(&mut messages, tool_calls, choice.message.content, ts).await;
+            }
+        }
+
+        Err(Error::MaxTurns(self.max_turns))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_usage_conversion() {
+        let api = ApiUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+        };
+        let usage = api_usage_to_token_usage(&api);
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn tool_call_deserialization() {
+        let json = r#"{
+            "id": "call_123",
+            "type": "function",
+            "function": { "name": "Read", "arguments": "{\"file_path\": \"/tmp/test\"}" }
+        }"#;
+        let tc: ApiToolCall = serde_json::from_str(json).unwrap();
+        assert_eq!(tc.id, "call_123");
+        assert_eq!(tc.function.name, "Read");
+    }
+
+    #[test]
+    fn api_response_deserialization() {
+        let json = r#"{
+            "choices": [{
+                "message": {
+                    "content": "Hello!",
+                    "tool_calls": null
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5
+            }
+        }"#;
+        let resp: ApiResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.choices.len(), 1);
+        assert_eq!(resp.choices[0].message.content.as_deref(), Some("Hello!"));
+        assert_eq!(resp.usage.unwrap().prompt_tokens, 10);
+    }
+
+    #[test]
+    fn api_response_with_tool_calls() {
+        let json = r#"{
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "Bash",
+                            "arguments": "{\"command\": \"ls\"}"
+                        }
+                    }]
+                }
+            }],
+            "usage": { "prompt_tokens": 20, "completion_tokens": 10 }
+        }"#;
+        let resp: ApiResponse = serde_json::from_str(json).unwrap();
+        let tool_calls = resp.choices[0].message.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "Bash");
+    }
+
+    #[test]
+    fn builder_defaults() {
+        let or = OpenRouter::new("test-model");
+        assert_eq!(or.model, "test-model");
+        assert_eq!(or.base_url, DEFAULT_BASE_URL);
+        assert_eq!(or.max_turns, 20);
+        assert!(or.system_prompt.is_none());
+        assert!(or.tool_set.is_none());
+    }
+
+    #[test]
+    fn builder_chaining() {
+        let or = OpenRouter::new("model")
+            .base_url("https://custom.api/v1")
+            .api_key("sk-test")
+            .system_prompt("Be helpful")
+            .max_turns(10)
+            .site_url("https://example.com")
+            .site_name("MyApp");
+        assert_eq!(or.base_url, "https://custom.api/v1");
+        assert_eq!(or.api_key, "sk-test");
+        assert_eq!(or.system_prompt.as_deref(), Some("Be helpful"));
+        assert_eq!(or.max_turns, 10);
+        assert_eq!(or.site_url.as_deref(), Some("https://example.com"));
+        assert_eq!(or.site_name.as_deref(), Some("MyApp"));
+    }
+}

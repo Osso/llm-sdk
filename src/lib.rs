@@ -1,5 +1,7 @@
 pub mod claude;
+pub mod openrouter;
 pub mod session;
+pub mod tools;
 
 pub use session::{LogEntry, LogUsage};
 
@@ -18,12 +20,21 @@ pub struct Output {
 }
 
 /// Token usage statistics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
+}
+
+impl TokenUsage {
+    pub fn accumulate(&mut self, other: &TokenUsage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_read_input_tokens += other.cache_read_input_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+    }
 }
 
 /// Errors that can occur during model completion.
@@ -41,4 +52,6 @@ pub enum Error {
     Parse(String),
     #[error("API error (status {status}): {body}")]
     Api { status: u16, body: String },
+    #[error("exceeded max turns ({0})")]
+    MaxTurns(u32),
 }
