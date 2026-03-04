@@ -18,13 +18,19 @@ fn claude_config_dir() -> String {
         .into_owned()
 }
 
-/// Resolve ~/.claude.json (MCP server config) that must be writable.
-fn claude_json_file() -> String {
+/// Writable state directory for MCP inside the sandbox.
+/// ~/.claude.json should be a symlink pointing here.
+fn mcp_state_dir() -> String {
     dirs::home_dir()
-        .map(|h| h.join(".claude.json"))
-        .unwrap_or_else(|| "/tmp/.claude.json".into())
+        .map(|h| h.join(".local/state/agent-orchestrator-mcp"))
+        .unwrap_or_else(|| "/tmp/agent-orchestrator-mcp".into())
         .to_string_lossy()
         .into_owned()
+}
+
+/// Ensure the MCP state directory exists.
+pub fn ensure_state_dirs() {
+    let _ = std::fs::create_dir_all(mcp_state_dir());
 }
 
 /// Build bwrap args for a developer agent.
@@ -35,7 +41,7 @@ fn claude_json_file() -> String {
 pub fn developer_prefix(worktree_path: &Path) -> Vec<String> {
     let worktree = worktree_path.to_string_lossy();
     let claude_dir = claude_config_dir();
-    let claude_json = claude_json_file();
+    let mcp_state = mcp_state_dir();
     [
         "bwrap",
         "--ro-bind", "/", "/",
@@ -43,7 +49,8 @@ pub fn developer_prefix(worktree_path: &Path) -> Vec<String> {
         "--tmpfs", "/tmp",
         "--bind", &worktree, REPO_MOUNT,
         "--bind", &claude_dir, &claude_dir,
-        "--bind", &claude_json, &claude_json,
+        "--bind", &mcp_state, &mcp_state,
+        "--chdir", REPO_MOUNT,
         "--die-with-parent",
         "--",
     ]
@@ -57,7 +64,7 @@ pub fn developer_prefix(worktree_path: &Path) -> Vec<String> {
 pub fn readonly_prefix(project_path: &Path) -> Vec<String> {
     let project = project_path.to_string_lossy();
     let claude_dir = claude_config_dir();
-    let claude_json = claude_json_file();
+    let mcp_state = mcp_state_dir();
     [
         "bwrap",
         "--ro-bind", "/", "/",
@@ -65,7 +72,8 @@ pub fn readonly_prefix(project_path: &Path) -> Vec<String> {
         "--tmpfs", "/tmp",
         "--ro-bind", &project, REPO_MOUNT,
         "--bind", &claude_dir, &claude_dir,
-        "--bind", &claude_json, &claude_json,
+        "--bind", &mcp_state, &mcp_state,
+        "--chdir", REPO_MOUNT,
         "--die-with-parent",
         "--",
     ]
@@ -124,28 +132,90 @@ mod tests {
     }
 
     #[test]
-    fn developer_prefix_binds_claude_json_writable() {
+    fn developer_prefix_binds_mcp_state_writable() {
         let worktree = PathBuf::from("/home/user/.worktrees/dev-0");
         let prefix = developer_prefix(&worktree);
 
         let home = dirs::home_dir().unwrap();
-        let claude_json = home.join(".claude.json").to_string_lossy().into_owned();
+        let mcp_state = home
+            .join(".local/state/agent-orchestrator-mcp")
+            .to_string_lossy()
+            .into_owned();
         assert!(
-            prefix.contains(&claude_json),
-            "developer sandbox must bind ~/.claude.json writable"
+            prefix.contains(&mcp_state),
+            "developer sandbox must bind mcp state dir writable"
         );
     }
 
     #[test]
-    fn readonly_prefix_binds_claude_json_writable() {
+    fn readonly_prefix_binds_mcp_state_writable() {
         let project = PathBuf::from("/tmp/test-project");
         let prefix = readonly_prefix(&project);
 
         let home = dirs::home_dir().unwrap();
-        let claude_json = home.join(".claude.json").to_string_lossy().into_owned();
+        let mcp_state = home
+            .join(".local/state/agent-orchestrator-mcp")
+            .to_string_lossy()
+            .into_owned();
         assert!(
-            prefix.contains(&claude_json),
-            "readonly sandbox must bind ~/.claude.json writable"
+            prefix.contains(&mcp_state),
+            "readonly sandbox must bind mcp state dir writable"
         );
+    }
+
+    #[test]
+    fn no_claude_json_bind_mount() {
+        let dev_prefix = developer_prefix(Path::new("/tmp/w"));
+        let ro_prefix = readonly_prefix(Path::new("/tmp/p"));
+        for prefix in [&dev_prefix, &ro_prefix] {
+            assert!(
+                !prefix.iter().any(|s| s.ends_with(".claude.json")),
+                "sandbox must not bind-mount ~/.claude.json directly; use state dir symlink instead"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_state_dir_is_writable_in_sandbox() {
+        if !is_available() {
+            return; // skip if bwrap not installed
+        }
+        ensure_state_dirs();
+        let project = PathBuf::from("/tmp");
+        let prefix = readonly_prefix(&project);
+        let state = mcp_state_dir();
+        let test_file = format!("{}/write-test", state);
+        let status = std::process::Command::new(&prefix[0])
+            .args(&prefix[1..])
+            .arg("touch")
+            .arg(&test_file)
+            .status()
+            .expect("failed to run bwrap");
+        assert!(status.success(), "touch inside sandbox must succeed");
+        assert!(
+            std::path::Path::new(&test_file).exists(),
+            "file written inside sandbox must be visible on host"
+        );
+        let _ = std::fs::remove_file(&test_file);
+    }
+
+    #[test]
+    fn developer_prefix_chdirs_to_repo_mount() {
+        let worktree = PathBuf::from("/home/user/.worktrees/dev-0");
+        let prefix = developer_prefix(&worktree);
+
+        let chdir_idx = prefix.iter().position(|s| s == "--chdir");
+        assert!(chdir_idx.is_some(), "developer prefix must include --chdir");
+        assert_eq!(prefix[chdir_idx.unwrap() + 1], REPO_MOUNT);
+    }
+
+    #[test]
+    fn readonly_prefix_chdirs_to_repo_mount() {
+        let project = PathBuf::from("/tmp/test-project");
+        let prefix = readonly_prefix(&project);
+
+        let chdir_idx = prefix.iter().position(|s| s == "--chdir");
+        assert!(chdir_idx.is_some(), "readonly prefix must include --chdir");
+        assert_eq!(prefix[chdir_idx.unwrap() + 1], REPO_MOUNT);
     }
 }

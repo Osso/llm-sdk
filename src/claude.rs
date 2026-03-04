@@ -221,8 +221,13 @@ impl Claude {
     }
 
     fn apply_io(&self, cmd: &mut Command) {
+        // Skip current_dir when command_prefix is set — the prefix (e.g. bwrap --chdir)
+        // handles working directory inside the namespace. Host-side chdir would fail
+        // because the mount point doesn't exist on the host.
         if let Some(ref dir) = self.working_dir {
-            cmd.current_dir(dir);
+            if self.command_prefix.is_empty() {
+                cmd.current_dir(dir);
+            }
         }
         for key in &self.env_removes {
             cmd.env_remove(key);

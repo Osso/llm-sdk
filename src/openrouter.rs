@@ -282,7 +282,7 @@ async fn append_tool_results(
             arguments: tc.function.arguments.clone(),
         };
         let result = tool_set.execute(&call).await;
-        tracing::debug!(tool = %call.name, "tool result: {} bytes", result.len());
+        tracing::info!(tool = %call.name, "tool result: {} bytes", result.len());
         messages.push(Message {
             role: "tool".into(),
             content: Some(result),
@@ -299,7 +299,8 @@ impl Backend for OpenRouter {
         let api_tools = self.tool_set.as_ref().map(tool_defs_to_api);
         let mut total_usage = TokenUsage::default();
 
-        for _turn in 0..self.max_turns {
+        for turn in 0..self.max_turns {
+            tracing::info!(turn, "OpenRouter API call ({} messages)", messages.len());
             let (resp, usage) = self.call_api(&messages, &api_tools).await?;
             total_usage.accumulate(&usage);
 
@@ -318,6 +319,9 @@ impl Backend for OpenRouter {
                     cost_usd: None,
                 });
             }
+
+            let tool_names: Vec<&str> = tool_calls.iter().map(|tc| tc.function.name.as_str()).collect();
+            tracing::info!(turn, "tool calls: {:?}", tool_names);
 
             if let Some(ref ts) = self.tool_set {
                 append_tool_results(&mut messages, tool_calls, choice.message.content, ts).await;
@@ -377,7 +381,8 @@ impl OpenRouter {
         let api_tools = self.tool_set.as_ref().map(tool_defs_to_api);
         let mut total_usage = TokenUsage::default();
 
-        for _turn in 0..self.max_turns {
+        for turn in 0..self.max_turns {
+            tracing::info!(turn, "OpenRouter chat API call ({} messages)", log.messages().len());
             let messages: Vec<Message> = log.messages().iter().map(chat_message_to_api).collect();
             let (resp, usage) = self.call_api(&messages, &api_tools).await?;
             total_usage.accumulate(&usage);
@@ -389,6 +394,8 @@ impl OpenRouter {
                 push_final_assistant(log, &text);
                 return Ok(Output { text, usage: Some(total_usage), session_id: None, cost_usd: None });
             }
+            let tool_names: Vec<&str> = tool_calls.iter().map(|tc| tc.function.name.as_str()).collect();
+            tracing::info!(turn, "tool calls: {:?}", tool_names);
             if let Some(ref ts) = self.tool_set {
                 self.run_tool_turn(log, tool_calls, choice.message.content, ts).await;
             }
@@ -401,7 +408,7 @@ impl OpenRouter {
         for tc in &tool_calls {
             let call = ToolCall { id: tc.id.clone(), name: tc.function.name.clone(), arguments: tc.function.arguments.clone() };
             let result = tool_set.execute(&call).await;
-            tracing::debug!(tool = %call.name, "tool result: {} bytes", result.len());
+            tracing::info!(tool = %call.name, "tool result: {} bytes", result.len());
             push_tool_result(log, &tc.id, result);
         }
     }
