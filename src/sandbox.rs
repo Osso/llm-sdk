@@ -1,10 +1,13 @@
 //! Bubblewrap (bwrap) sandbox for agent isolation.
 //!
-//! Developers get their worktree bind-mounted at the project path so Claude
-//! sees the real project location but writes go to the isolated worktree.
-//! Non-developer agents get a read-only sandbox.
+//! All agents see the project at `/repo` inside the sandbox.
+//! Developers get their worktree bind-mounted writable at `/repo`.
+//! Non-developer agents get the real project read-only at `/repo`.
 
 use std::path::Path;
+
+/// Standard mount point for the project inside the sandbox.
+pub const REPO_MOUNT: &str = "/tmp/repo";
 
 /// Resolve the Claude config directory (~/.claude) that must be writable.
 fn claude_config_dir() -> String {
@@ -25,13 +28,12 @@ fn claude_json_file() -> String {
 }
 
 /// Build bwrap args for a developer agent.
-/// Worktree is mounted at the project path so writes land in the worktree.
+/// Worktree is mounted writable at `/repo`.
 ///
 /// Note: --proc /proc is omitted because Bun (Claude CLI runtime) hangs
 /// when bwrap mounts a synthetic procfs.
-pub fn developer_prefix(worktree_path: &Path, project_path: &Path) -> Vec<String> {
+pub fn developer_prefix(worktree_path: &Path) -> Vec<String> {
     let worktree = worktree_path.to_string_lossy();
-    let project = project_path.to_string_lossy();
     let claude_dir = claude_config_dir();
     let claude_json = claude_json_file();
     [
@@ -39,7 +41,7 @@ pub fn developer_prefix(worktree_path: &Path, project_path: &Path) -> Vec<String
         "--ro-bind", "/", "/",
         "--dev", "/dev",
         "--tmpfs", "/tmp",
-        "--bind", &worktree, &project,
+        "--bind", &worktree, REPO_MOUNT,
         "--bind", &claude_dir, &claude_dir,
         "--bind", &claude_json, &claude_json,
         "--die-with-parent",
@@ -51,7 +53,9 @@ pub fn developer_prefix(worktree_path: &Path, project_path: &Path) -> Vec<String
 }
 
 /// Build bwrap args for a read-only sandbox (non-developer agents).
-pub fn readonly_prefix() -> Vec<String> {
+/// Project is mounted read-only at `/repo`.
+pub fn readonly_prefix(project_path: &Path) -> Vec<String> {
+    let project = project_path.to_string_lossy();
     let claude_dir = claude_config_dir();
     let claude_json = claude_json_file();
     [
@@ -59,6 +63,7 @@ pub fn readonly_prefix() -> Vec<String> {
         "--ro-bind", "/", "/",
         "--dev", "/dev",
         "--tmpfs", "/tmp",
+        "--ro-bind", &project, REPO_MOUNT,
         "--bind", &claude_dir, &claude_dir,
         "--bind", &claude_json, &claude_json,
         "--die-with-parent",
@@ -85,42 +90,44 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn developer_prefix_mounts_worktree_at_project() {
+    fn developer_prefix_mounts_worktree_at_repo() {
         let worktree = PathBuf::from("/home/user/.worktrees/dev-0");
-        let project = PathBuf::from("/home/user/projects/myapp");
-        let prefix = developer_prefix(&worktree, &project);
+        let prefix = developer_prefix(&worktree);
 
         assert_eq!(prefix[0], "bwrap");
         let bind_idx = prefix.iter().position(|s| s == "--bind").unwrap();
         assert_eq!(prefix[bind_idx + 1], "/home/user/.worktrees/dev-0");
-        assert_eq!(prefix[bind_idx + 2], "/home/user/projects/myapp");
+        assert_eq!(prefix[bind_idx + 2], REPO_MOUNT);
         assert!(!prefix.contains(&"--proc".to_string()));
         assert_eq!(prefix.last().unwrap(), "--");
     }
 
     #[test]
-    fn readonly_prefix_has_no_writable_project_bind() {
-        let prefix = readonly_prefix();
+    fn readonly_prefix_mounts_project_readonly_at_repo() {
+        let project = PathBuf::from("/tmp/test-project");
+        let prefix = readonly_prefix(&project);
+
         assert_eq!(prefix[0], "bwrap");
-        assert!(prefix.contains(&"--ro-bind".to_string()));
-        // Only --bind should be for ~/.claude
-        let bind_positions: Vec<_> = prefix
+        // Project should be --ro-bind at /repo
+        let ro_binds: Vec<_> = prefix
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.as_str() == "--bind")
+            .filter(|(_, s)| s.as_str() == "--ro-bind")
             .map(|(i, _)| i)
             .collect();
-        assert_eq!(bind_positions.len(), 2, "~/.claude and ~/.claude.json should be writable");
+        // Two ro-binds: / -> / and project -> /repo
+        assert_eq!(ro_binds.len(), 2);
+        let proj_bind = ro_binds[1];
+        assert_eq!(prefix[proj_bind + 1], "/tmp/test-project");
+        assert_eq!(prefix[proj_bind + 2], REPO_MOUNT);
         assert_eq!(prefix.last().unwrap(), "--");
     }
 
     #[test]
     fn developer_prefix_binds_claude_json_writable() {
         let worktree = PathBuf::from("/home/user/.worktrees/dev-0");
-        let project = PathBuf::from("/home/user/projects/myapp");
-        let prefix = developer_prefix(&worktree, &project);
+        let prefix = developer_prefix(&worktree);
 
-        // ~/.claude.json must be writable for MCP server config
         let home = dirs::home_dir().unwrap();
         let claude_json = home.join(".claude.json").to_string_lossy().into_owned();
         assert!(
@@ -131,7 +138,8 @@ mod tests {
 
     #[test]
     fn readonly_prefix_binds_claude_json_writable() {
-        let prefix = readonly_prefix();
+        let project = PathBuf::from("/tmp/test-project");
+        let prefix = readonly_prefix(&project);
 
         let home = dirs::home_dir().unwrap();
         let claude_json = home.join(".claude.json").to_string_lossy().into_owned();
