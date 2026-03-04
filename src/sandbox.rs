@@ -15,6 +15,15 @@ fn claude_config_dir() -> String {
         .into_owned()
 }
 
+/// Resolve ~/.claude.json (MCP server config) that must be writable.
+fn claude_json_file() -> String {
+    dirs::home_dir()
+        .map(|h| h.join(".claude.json"))
+        .unwrap_or_else(|| "/tmp/.claude.json".into())
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Build bwrap args for a developer agent.
 /// Worktree is mounted at the project path so writes land in the worktree.
 ///
@@ -24,6 +33,7 @@ pub fn developer_prefix(worktree_path: &Path, project_path: &Path) -> Vec<String
     let worktree = worktree_path.to_string_lossy();
     let project = project_path.to_string_lossy();
     let claude_dir = claude_config_dir();
+    let claude_json = claude_json_file();
     [
         "bwrap",
         "--ro-bind", "/", "/",
@@ -31,6 +41,7 @@ pub fn developer_prefix(worktree_path: &Path, project_path: &Path) -> Vec<String
         "--tmpfs", "/tmp",
         "--bind", &worktree, &project,
         "--bind", &claude_dir, &claude_dir,
+        "--bind", &claude_json, &claude_json,
         "--die-with-parent",
         "--",
     ]
@@ -42,12 +53,14 @@ pub fn developer_prefix(worktree_path: &Path, project_path: &Path) -> Vec<String
 /// Build bwrap args for a read-only sandbox (non-developer agents).
 pub fn readonly_prefix() -> Vec<String> {
     let claude_dir = claude_config_dir();
+    let claude_json = claude_json_file();
     [
         "bwrap",
         "--ro-bind", "/", "/",
         "--dev", "/dev",
         "--tmpfs", "/tmp",
         "--bind", &claude_dir, &claude_dir,
+        "--bind", &claude_json, &claude_json,
         "--die-with-parent",
         "--",
     ]
@@ -97,7 +110,34 @@ mod tests {
             .filter(|(_, s)| s.as_str() == "--bind")
             .map(|(i, _)| i)
             .collect();
-        assert_eq!(bind_positions.len(), 1, "only ~/.claude should be writable");
+        assert_eq!(bind_positions.len(), 2, "~/.claude and ~/.claude.json should be writable");
         assert_eq!(prefix.last().unwrap(), "--");
+    }
+
+    #[test]
+    fn developer_prefix_binds_claude_json_writable() {
+        let worktree = PathBuf::from("/home/user/.worktrees/dev-0");
+        let project = PathBuf::from("/home/user/projects/myapp");
+        let prefix = developer_prefix(&worktree, &project);
+
+        // ~/.claude.json must be writable for MCP server config
+        let home = dirs::home_dir().unwrap();
+        let claude_json = home.join(".claude.json").to_string_lossy().into_owned();
+        assert!(
+            prefix.contains(&claude_json),
+            "developer sandbox must bind ~/.claude.json writable"
+        );
+    }
+
+    #[test]
+    fn readonly_prefix_binds_claude_json_writable() {
+        let prefix = readonly_prefix();
+
+        let home = dirs::home_dir().unwrap();
+        let claude_json = home.join(".claude.json").to_string_lossy().into_owned();
+        assert!(
+            prefix.contains(&claude_json),
+            "readonly sandbox must bind ~/.claude.json writable"
+        );
     }
 }
