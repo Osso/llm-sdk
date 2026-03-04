@@ -140,10 +140,6 @@ impl Session {
             }
             c
         };
-        let output = claude.complete(prompt).await?;
-        self.created = true;
-        self.persist();
-
         let data_dir = self.data_dir();
         append_log(
             &data_dir,
@@ -153,6 +149,11 @@ impl Session {
                 timestamp: now_utc(),
             },
         );
+
+        let output = claude.complete(prompt).await?;
+        self.created = true;
+        self.persist();
+
         append_log(
             &data_dir,
             &self.key,
