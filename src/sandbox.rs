@@ -55,7 +55,7 @@ pub fn developer_prefix(worktree_path: &Path, git_dir: Option<&Path>) -> Vec<Str
         "bwrap",
         "--ro-bind", "/", "/",
         "--dev", "/dev",
-        "--tmpfs", "/tmp",
+        "--bind", "/tmp", "/tmp",
         "--bind", &worktree, REPO_MOUNT,
         "--bind", &claude_dir, &claude_dir,
         "--bind", &mcp_state, &mcp_state,
@@ -87,7 +87,7 @@ pub fn readonly_prefix(project_path: &Path) -> Vec<String> {
         "bwrap",
         "--ro-bind", "/", "/",
         "--dev", "/dev",
-        "--tmpfs", "/tmp",
+        "--bind", "/tmp", "/tmp",
         "--ro-bind", &project, REPO_MOUNT,
         "--bind", &claude_dir, &claude_dir,
         "--bind", &mcp_state, &mcp_state,
@@ -121,9 +121,11 @@ mod tests {
         let prefix = developer_prefix(&worktree, None);
 
         assert_eq!(prefix[0], "bwrap");
-        let bind_idx = prefix.iter().position(|s| s == "--bind").unwrap();
-        assert_eq!(prefix[bind_idx + 1], "/home/user/.worktrees/dev-0");
-        assert_eq!(prefix[bind_idx + 2], REPO_MOUNT);
+        // Find the --bind that maps the worktree to /tmp/repo
+        let repo_bind = prefix.windows(3)
+            .position(|w| w[0] == "--bind" && w[2] == REPO_MOUNT)
+            .expect("should have --bind <worktree> /tmp/repo");
+        assert_eq!(prefix[repo_bind + 1], "/home/user/.worktrees/dev-0");
         assert!(!prefix.contains(&"--proc".to_string()));
         assert_eq!(prefix.last().unwrap(), "--");
     }
@@ -286,8 +288,10 @@ mod tests {
         let prefix = developer_prefix(&link, Some(&link));
         let real_str = real_dir.to_string_lossy().to_string();
 
-        // Worktree bind should use resolved path
-        let bind_idx = prefix.iter().position(|s| s == "--bind").unwrap();
+        // Worktree bind should use resolved path (find the one mapping to /tmp/repo)
+        let bind_idx = prefix.windows(3)
+            .position(|w| w[0] == "--bind" && w[2] == REPO_MOUNT)
+            .expect("should have --bind <worktree> /tmp/repo");
         assert_eq!(prefix[bind_idx + 1], real_str, "worktree must be canonicalized");
 
         // Git dir bind should also use resolved path
