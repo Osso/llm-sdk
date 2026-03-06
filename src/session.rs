@@ -1,6 +1,7 @@
 use crate::claude::Claude;
 use crate::message_log::MessageLog;
-use crate::{Backend, Error, Output};
+use crate::stream::{EventSink, StreamEvent};
+use crate::{Error, Output};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -131,15 +132,7 @@ impl Session {
     }
 
     async fn try_complete(&mut self, base: &Claude, prompt: &str) -> Result<Output, Error> {
-        let claude = if self.created {
-            base.clone().resume(&self.session_id)
-        } else {
-            let mut c = base.clone().session_id(&self.session_id);
-            if let Some(ref sp) = self.system_prompt {
-                c = c.system_prompt(sp);
-            }
-            c
-        };
+        let claude = build_claude_for_session(base, &self.session_id, self.created, &self.system_prompt);
         let data_dir = self.data_dir();
         append_log(
             &data_dir,
@@ -150,10 +143,10 @@ impl Session {
             },
         );
 
-        let output = claude.complete(prompt).await?;
+        let mut sink = LogSink::new(&data_dir, &self.key);
+        let output = claude.complete_streaming(prompt, &mut sink).await?;
         self.created = true;
         self.persist();
-
         append_log(
             &data_dir,
             &self.key,
@@ -168,7 +161,6 @@ impl Session {
                 }),
             },
         );
-
         Ok(output)
     }
 
@@ -179,6 +171,63 @@ impl Session {
             .insert(self.key.clone(), self.session_id.clone());
         write_sessions(&inner.data_dir, &inner.sessions);
     }
+}
+
+fn build_claude_for_session(
+    base: &Claude,
+    session_id: &str,
+    created: bool,
+    system_prompt: &Option<String>,
+) -> Claude {
+    if created {
+        base.clone().resume(session_id)
+    } else {
+        let mut c = base.clone().session_id(session_id);
+        if let Some(sp) = system_prompt {
+            c = c.system_prompt(sp);
+        }
+        c
+    }
+}
+
+/// Streams raw JSON event lines into the JSONL session log.
+struct LogSink {
+    data_dir: PathBuf,
+    key: String,
+}
+
+impl LogSink {
+    fn new(data_dir: &Path, key: &str) -> Self {
+        Self {
+            data_dir: data_dir.to_path_buf(),
+            key: key.to_string(),
+        }
+    }
+}
+
+impl EventSink for LogSink {
+    fn on_event(&mut self, raw: &str, _event: &StreamEvent) {
+        append_raw_line(&self.data_dir, &self.key, raw);
+    }
+}
+
+/// Append a raw JSON line to the JSONL log file.
+fn append_raw_line(data_dir: &Path, key: &str, line: &str) {
+    let logs_dir = data_dir.join("logs");
+    if std::fs::create_dir_all(&logs_dir).is_err() {
+        return;
+    }
+    let path = logs_dir.join(format!("{key}.jsonl"));
+    let mut file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    use std::io::Write;
+    let _ = writeln!(file, "{line}");
 }
 
 /// A single entry in the per-key JSONL conversation log.
