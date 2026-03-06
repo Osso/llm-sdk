@@ -35,14 +35,15 @@ pub fn ensure_state_dirs() {
 
 /// Build bwrap args for a developer agent.
 /// Worktree is mounted writable at `/repo`.
+/// The main repo's `.git` dir is also mounted writable so the worktree can write objects/refs.
 ///
 /// Note: --proc /proc is omitted because Bun (Claude CLI runtime) hangs
 /// when bwrap mounts a synthetic procfs.
-pub fn developer_prefix(worktree_path: &Path) -> Vec<String> {
+pub fn developer_prefix(worktree_path: &Path, git_dir: Option<&Path>) -> Vec<String> {
     let worktree = worktree_path.to_string_lossy();
     let claude_dir = claude_config_dir();
     let mcp_state = mcp_state_dir();
-    [
+    let mut args: Vec<String> = [
         "bwrap",
         "--ro-bind", "/", "/",
         "--dev", "/dev",
@@ -50,13 +51,22 @@ pub fn developer_prefix(worktree_path: &Path) -> Vec<String> {
         "--bind", &worktree, REPO_MOUNT,
         "--bind", &claude_dir, &claude_dir,
         "--bind", &mcp_state, &mcp_state,
-        "--chdir", REPO_MOUNT,
-        "--die-with-parent",
-        "--",
     ]
     .iter()
     .map(|s| s.to_string())
-    .collect()
+    .collect();
+
+    if let Some(gd) = git_dir {
+        let gd_str = gd.to_string_lossy();
+        args.extend(["--bind".to_string(), gd_str.to_string(), gd_str.to_string()]);
+    }
+
+    args.extend([
+        "--chdir".to_string(), REPO_MOUNT.to_string(),
+        "--die-with-parent".to_string(),
+        "--".to_string(),
+    ]);
+    args
 }
 
 /// Build bwrap args for a read-only sandbox (non-developer agents).
@@ -100,7 +110,7 @@ mod tests {
     #[test]
     fn developer_prefix_mounts_worktree_at_repo() {
         let worktree = PathBuf::from("/home/user/.worktrees/dev-0");
-        let prefix = developer_prefix(&worktree);
+        let prefix = developer_prefix(&worktree, None);
 
         assert_eq!(prefix[0], "bwrap");
         let bind_idx = prefix.iter().position(|s| s == "--bind").unwrap();
@@ -134,7 +144,7 @@ mod tests {
     #[test]
     fn developer_prefix_binds_mcp_state_writable() {
         let worktree = PathBuf::from("/home/user/.worktrees/dev-0");
-        let prefix = developer_prefix(&worktree);
+        let prefix = developer_prefix(&worktree, None);
 
         let home = dirs::home_dir().unwrap();
         let mcp_state = home
@@ -165,7 +175,7 @@ mod tests {
 
     #[test]
     fn no_claude_json_bind_mount() {
-        let dev_prefix = developer_prefix(Path::new("/tmp/w"));
+        let dev_prefix = developer_prefix(Path::new("/tmp/w"), None);
         let ro_prefix = readonly_prefix(Path::new("/tmp/p"));
         for prefix in [&dev_prefix, &ro_prefix] {
             assert!(
@@ -202,7 +212,7 @@ mod tests {
     #[test]
     fn developer_prefix_chdirs_to_repo_mount() {
         let worktree = PathBuf::from("/home/user/.worktrees/dev-0");
-        let prefix = developer_prefix(&worktree);
+        let prefix = developer_prefix(&worktree, None);
 
         let chdir_idx = prefix.iter().position(|s| s == "--chdir");
         assert!(chdir_idx.is_some(), "developer prefix must include --chdir");

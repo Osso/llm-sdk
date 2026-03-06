@@ -17,13 +17,6 @@ impl BashTool {
         }
     }
 
-    pub fn with_working_dir(dir: PathBuf) -> Self {
-        Self {
-            working_dir: Some(dir),
-            command_prefix: Vec::new(),
-        }
-    }
-
     /// Prepend a command prefix (e.g. bwrap sandbox args) before bash.
     pub fn with_command_prefix(mut self, prefix: Vec<String>) -> Self {
         self.command_prefix = prefix;
@@ -104,7 +97,7 @@ mod tests {
 
     #[test]
     fn build_command_with_working_dir() {
-        let tool = BashTool::with_working_dir(PathBuf::from("/tmp"));
+        let tool = BashTool { working_dir: Some(PathBuf::from("/tmp")), command_prefix: Vec::new() };
         let cmd = tool.build_command("ls");
         assert_eq!(cmd.as_std().get_current_dir(), Some(std::path::Path::new("/tmp")));
     }
