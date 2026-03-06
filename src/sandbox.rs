@@ -33,6 +33,14 @@ pub fn ensure_state_dirs() {
     let _ = std::fs::create_dir_all(mcp_state_dir());
 }
 
+/// Resolve symlinks so bwrap gets real paths (it can't mkdir through symlinks).
+fn canonicalize_or_keep(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Build bwrap args for a developer agent.
 /// Worktree is mounted writable at `/repo`.
 /// The main repo's `.git` dir is also mounted writable so the worktree can write objects/refs.
@@ -40,7 +48,7 @@ pub fn ensure_state_dirs() {
 /// Note: --proc /proc is omitted because Bun (Claude CLI runtime) hangs
 /// when bwrap mounts a synthetic procfs.
 pub fn developer_prefix(worktree_path: &Path, git_dir: Option<&Path>) -> Vec<String> {
-    let worktree = worktree_path.to_string_lossy();
+    let worktree = canonicalize_or_keep(worktree_path);
     let claude_dir = claude_config_dir();
     let mcp_state = mcp_state_dir();
     let mut args: Vec<String> = [
@@ -57,8 +65,8 @@ pub fn developer_prefix(worktree_path: &Path, git_dir: Option<&Path>) -> Vec<Str
     .collect();
 
     if let Some(gd) = git_dir {
-        let gd_str = gd.to_string_lossy();
-        args.extend(["--bind".to_string(), gd_str.to_string(), gd_str.to_string()]);
+        let gd_str = canonicalize_or_keep(gd);
+        args.extend(["--bind".to_string(), gd_str.clone(), gd_str]);
     }
 
     args.extend([
@@ -72,7 +80,7 @@ pub fn developer_prefix(worktree_path: &Path, git_dir: Option<&Path>) -> Vec<Str
 /// Build bwrap args for a read-only sandbox (non-developer agents).
 /// Project is mounted read-only at `/repo`.
 pub fn readonly_prefix(project_path: &Path) -> Vec<String> {
-    let project = project_path.to_string_lossy();
+    let project = canonicalize_or_keep(project_path);
     let claude_dir = claude_config_dir();
     let mcp_state = mcp_state_dir();
     [
@@ -217,6 +225,79 @@ mod tests {
         let chdir_idx = prefix.iter().position(|s| s == "--chdir");
         assert!(chdir_idx.is_some(), "developer prefix must include --chdir");
         assert_eq!(prefix[chdir_idx.unwrap() + 1], REPO_MOUNT);
+    }
+
+    #[test]
+    fn developer_prefix_mounts_git_dir_writable() {
+        let worktree = PathBuf::from("/home/user/.worktrees/dev-0");
+        let git_dir = PathBuf::from("/home/user/project/.git");
+        let prefix = developer_prefix(&worktree, Some(&git_dir));
+
+        // Find all --bind (RW) mounts
+        let rw_binds: Vec<usize> = prefix
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.as_str() == "--bind")
+            .map(|(i, _)| i)
+            .collect();
+
+        // .git dir must appear as a --bind (not --ro-bind)
+        let git_bound = rw_binds.iter().any(|&i| {
+            prefix.get(i + 1).is_some_and(|s| s == "/home/user/project/.git")
+        });
+        assert!(git_bound, "git dir must be mounted RW via --bind, got: {:?}", prefix);
+    }
+
+    #[test]
+    fn developer_prefix_git_dir_is_writable_in_sandbox() {
+        if !is_available() {
+            return;
+        }
+        // Create a real temp worktree and .git dir to test actual bwrap
+        let tmp = std::env::temp_dir().join("sandbox-git-test");
+        let worktree = tmp.join("worktree");
+        let git_dir = tmp.join("dotgit");
+        let _ = std::fs::create_dir_all(&worktree);
+        let _ = std::fs::create_dir_all(&git_dir);
+
+        let prefix = developer_prefix(&worktree, Some(&git_dir));
+        let test_file = git_dir.join("write-test");
+        let status = std::process::Command::new(&prefix[0])
+            .args(&prefix[1..])
+            .arg("touch")
+            .arg(test_file.to_string_lossy().as_ref())
+            .status()
+            .expect("failed to run bwrap");
+
+        assert!(status.success(), "writing to .git dir inside sandbox must succeed");
+        assert!(test_file.exists(), ".git write must be visible on host");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn developer_prefix_resolves_symlinks() {
+        let tmp = std::env::temp_dir().join("sandbox-symlink-test");
+        let real_dir = tmp.join("real");
+        let link = tmp.join("link");
+        let _ = std::fs::create_dir_all(&real_dir);
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real_dir, &link).unwrap();
+
+        let prefix = developer_prefix(&link, Some(&link));
+        let real_str = real_dir.to_string_lossy().to_string();
+
+        // Worktree bind should use resolved path
+        let bind_idx = prefix.iter().position(|s| s == "--bind").unwrap();
+        assert_eq!(prefix[bind_idx + 1], real_str, "worktree must be canonicalized");
+
+        // Git dir bind should also use resolved path
+        let link_str = link.to_string_lossy().to_string();
+        assert!(
+            !prefix.contains(&link_str),
+            "symlink path must not appear in bwrap args: {:?}", prefix
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
