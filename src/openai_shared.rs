@@ -154,29 +154,30 @@ pub(crate) fn parse_chat_response(
     let agent_usage = llm_agent::Usage {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
+        reasoning_tokens: 0,
     };
-    if tool_calls.is_empty() {
-        Ok((
-            llm_agent::Response::Text(choice.message.content.unwrap_or_default()),
-            agent_usage,
-        ))
-    } else {
-        let calls = tool_calls.iter().map(api_tool_call_to_agent).collect();
-        Ok((
-            llm_agent::Response::ToolCalls {
-                text: choice.message.content,
-                calls,
-            },
-            agent_usage,
-        ))
+    let mut parts = Vec::new();
+    if let Some(text) = choice.message.content {
+        if !text.is_empty() {
+            parts.push(llm_agent::Part::Text(text));
+        }
     }
+    let finish_reason = if tool_calls.is_empty() {
+        "stop".to_string()
+    } else {
+        for tc in &tool_calls {
+            parts.push(llm_agent::Part::ToolUse(api_tool_call_to_agent(tc)));
+        }
+        "tool_calls".to_string()
+    };
+    Ok((llm_agent::Response { parts, finish_reason }, agent_usage))
 }
 
 // --- AgentLoop helpers ---
 
 pub(crate) fn agent_output_to_sdk(output: llm_agent::AgentOutput) -> Output {
     Output {
-        text: output.text,
+        text: output.text(),
         usage: Some(TokenUsage {
             input_tokens: output.usage.input_tokens,
             output_tokens: output.usage.output_tokens,
