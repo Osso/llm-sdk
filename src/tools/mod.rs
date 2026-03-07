@@ -25,6 +25,12 @@ pub struct ToolCall {
 pub trait ToolDef: Send + Sync {
     fn definition(&self) -> Tool;
     async fn execute(&self, arguments: &str) -> String;
+
+    /// Whether this tool can run in parallel with other parallel-safe tools.
+    /// Default: false (serial execution).
+    fn supports_parallel(&self) -> bool {
+        false
+    }
 }
 
 /// Registry of tools.
@@ -80,6 +86,13 @@ impl ToolSet {
     pub fn merge(mut self, other: ToolSet) -> Self {
         self.tools.extend(other.tools);
         self
+    }
+
+    pub fn supports_parallel(&self, tool_name: &str) -> bool {
+        self.tools
+            .iter()
+            .find(|t| t.definition().name == tool_name)
+            .is_some_and(|t| t.supports_parallel())
     }
 
     pub fn is_empty(&self) -> bool {

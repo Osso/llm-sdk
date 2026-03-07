@@ -19,4 +19,4 @@ walkdir = "2"
 tracing = "0.1"
 which = "7"
 dirs = "6"
-llm-agent = { git = "https://github.com/Osso/llm-agent" }
+llm-agent = { path = "../llm-agent" }

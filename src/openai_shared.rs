@@ -221,6 +221,10 @@ impl llm_agent::ToolExecutor for ToolSetExecutor<'_> {
         };
         self.tool_set.execute(&call).await
     }
+
+    fn supports_parallel(&self, tool_name: &str) -> bool {
+        self.tool_set.supports_parallel(tool_name)
+    }
 }
 
 pub(crate) struct NoOpExecutor;

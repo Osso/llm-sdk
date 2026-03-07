@@ -29,6 +29,8 @@ impl ToolDef for GrepTool {
         }
     }
 
+    fn supports_parallel(&self) -> bool { true }
+
     async fn execute(&self, arguments: &str) -> String {
         let args: Args = match serde_json::from_str(arguments) {
             Ok(a) => a,
