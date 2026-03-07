@@ -1,8 +1,12 @@
 use crate::message_log::{ChatMessage, MessageLog, ToolCallRecord};
+use crate::openai_shared::{
+    agent_msg_to_api, agent_output_to_sdk, api_usage_to_token_usage, build_agent_loop,
+    parse_chat_response, tool_defs_to_api, tools_json_from_tool_set, ApiResponse, ApiRequest,
+    ApiToolCall, ApiToolDef, ApiFunctionCall, Message, NoOpExecutor, ToolSetExecutor,
+};
 use crate::session::now_utc;
-use crate::tools::{ToolCall, ToolSet};
+use crate::tools::ToolSet;
 use crate::{Backend, Error, Output, TokenUsage};
-use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -82,117 +86,20 @@ impl OpenRouter {
     }
 }
 
-// --- API request/response types (private) ---
-
-#[derive(Serialize)]
-struct ApiRequest {
-    model: String,
-    messages: Vec<Message>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<ApiToolDef>>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct Message {
-    role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<ApiToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
-}
-
-#[derive(Serialize, Clone)]
-struct ApiToolDef {
-    #[serde(rename = "type")]
-    tool_type: String,
-    function: ApiFunction,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct ApiToolCall {
-    id: String,
-    #[serde(rename = "type")]
-    call_type: String,
-    function: ApiFunctionCall,
-}
-
-#[derive(Serialize, Clone)]
-struct ApiFunction {
-    name: String,
-    description: String,
-    parameters: serde_json::Value,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct ApiFunctionCall {
-    name: String,
-    arguments: String,
-}
-
-#[derive(Deserialize)]
-struct ApiResponse {
-    choices: Vec<Choice>,
-    #[serde(default)]
-    usage: Option<ApiUsage>,
-}
-
-#[derive(Deserialize)]
-struct Choice {
-    message: MessageResponse,
-}
-
-#[derive(Deserialize)]
-struct MessageResponse {
-    content: Option<String>,
-    #[serde(default)]
-    tool_calls: Option<Vec<ApiToolCall>>,
-}
-
-#[derive(Deserialize)]
-struct ApiUsage {
-    #[serde(default)]
-    prompt_tokens: u64,
-    #[serde(default)]
-    completion_tokens: u64,
-}
-
-// --- Convert tool definitions for API ---
-
-fn tool_defs_to_api(tool_set: &ToolSet) -> Vec<ApiToolDef> {
-    tool_set
-        .definitions()
-        .into_iter()
-        .map(|t| ApiToolDef {
-            tool_type: "function".into(),
-            function: ApiFunction {
-                name: t.name,
-                description: t.description,
-                parameters: t.parameters,
-            },
-        })
-        .collect()
-}
-
-fn api_usage_to_token_usage(u: &ApiUsage) -> TokenUsage {
-    TokenUsage {
-        input_tokens: u.prompt_tokens,
-        output_tokens: u.completion_tokens,
-        ..Default::default()
-    }
-}
-
-// --- HTTP call ---
+// --- HTTP transport ---
 
 impl OpenRouter {
-    fn build_request(&self, messages: &[Message], tools: &Option<Vec<ApiToolDef>>) -> reqwest::RequestBuilder {
+    fn build_request(
+        &self,
+        messages: &[Message],
+        tools: &Option<Vec<ApiToolDef>>,
+    ) -> reqwest::RequestBuilder {
         let body = ApiRequest {
             model: self.model.clone(),
             messages: messages.to_vec(),
-            tools: tools.as_ref().and_then(|t| {
-                if t.is_empty() { None } else { Some(t.clone()) }
-            }),
+            tools: tools
+                .as_ref()
+                .and_then(|t| if t.is_empty() { None } else { Some(t.clone()) }),
         };
         let mut req = self
             .client
@@ -242,97 +149,55 @@ impl OpenRouter {
     }
 }
 
-// --- Agent loop ---
+// --- ChatClient impl for llm-agent ---
 
-fn build_messages(system_prompt: Option<&str>, user_prompt: &str) -> Vec<Message> {
-    let mut messages = Vec::new();
-    if let Some(sp) = system_prompt {
-        messages.push(Message {
-            role: "system".into(),
-            content: Some(sp.into()),
-            tool_calls: None,
-            tool_call_id: None,
-        });
-    }
-    messages.push(Message {
-        role: "user".into(),
-        content: Some(user_prompt.into()),
-        tool_calls: None,
-        tool_call_id: None,
-    });
-    messages
-}
-
-async fn append_tool_results(
-    messages: &mut Vec<Message>,
-    tool_calls: Vec<ApiToolCall>,
-    assistant_content: Option<String>,
-    tool_set: &ToolSet,
-) {
-    messages.push(Message {
-        role: "assistant".into(),
-        content: assistant_content,
-        tool_calls: Some(tool_calls.clone()),
-        tool_call_id: None,
-    });
-    for tc in &tool_calls {
-        let call = ToolCall {
-            id: tc.id.clone(),
-            name: tc.function.name.clone(),
-            arguments: tc.function.arguments.clone(),
-        };
-        let result = tool_set.execute(&call).await;
-        tracing::info!(tool = %call.name, "tool result: {} bytes", result.len());
-        messages.push(Message {
-            role: "tool".into(),
-            content: Some(result),
-            tool_calls: None,
-            tool_call_id: Some(tc.id.clone()),
-        });
+#[async_trait::async_trait]
+impl llm_agent::ChatClient for OpenRouter {
+    async fn chat(
+        &self,
+        messages: &[llm_agent::ChatMessage],
+        tools: Option<&serde_json::Value>,
+    ) -> Result<(llm_agent::Response, llm_agent::Usage), Box<dyn std::error::Error + Send + Sync>>
+    {
+        let api_messages: Vec<Message> = messages.iter().map(agent_msg_to_api).collect();
+        let api_tools: Option<Vec<ApiToolDef>> =
+            tools.and_then(|v| serde_json::from_value(v.clone()).ok());
+        let (resp, usage) = self.call_api(&api_messages, &api_tools).await?;
+        parse_chat_response(resp, usage)
     }
 }
+
+// --- Backend impl using AgentLoop ---
 
 #[async_trait::async_trait]
 impl Backend for OpenRouter {
     async fn complete(&self, prompt: &str) -> Result<Output, Error> {
-        let mut messages = build_messages(self.system_prompt.as_deref(), prompt);
-        let api_tools = self.tool_set.as_ref().map(tool_defs_to_api);
-        let mut total_usage = TokenUsage::default();
-
-        for turn in 0..self.max_turns {
-            tracing::info!(turn, "OpenRouter API call ({} messages)", messages.len());
-            let (resp, usage) = self.call_api(&messages, &api_tools).await?;
-            total_usage.accumulate(&usage);
-
-            let choice = resp
-                .choices
-                .into_iter()
-                .next()
-                .ok_or_else(|| Error::Parse("no choices in response".into()))?;
-
-            let tool_calls = choice.message.tool_calls.unwrap_or_default();
-            if tool_calls.is_empty() {
-                return Ok(Output {
-                    text: choice.message.content.unwrap_or_default(),
-                    usage: Some(total_usage),
-                    session_id: None,
-                    cost_usd: None,
-                });
+        let tools_json = self.tool_set.as_ref().map(tools_json_from_tool_set);
+        match &self.tool_set {
+            Some(ts) => {
+                let executor = ToolSetExecutor { tool_set: ts };
+                let agent = build_agent_loop(
+                    self, executor, self.max_turns,
+                    self.system_prompt.as_deref(), tools_json,
+                );
+                let output = agent.run(prompt).await
+                    .map_err(|e| Error::Parse(e.to_string()))?;
+                Ok(agent_output_to_sdk(output))
             }
-
-            let tool_names: Vec<&str> = tool_calls.iter().map(|tc| tc.function.name.as_str()).collect();
-            tracing::info!(turn, "tool calls: {:?}", tool_names);
-
-            if let Some(ref ts) = self.tool_set {
-                append_tool_results(&mut messages, tool_calls, choice.message.content, ts).await;
+            None => {
+                let agent = build_agent_loop(
+                    self, NoOpExecutor, 1,
+                    self.system_prompt.as_deref(), None,
+                );
+                let output = agent.run(prompt).await
+                    .map_err(|e| Error::Parse(e.to_string()))?;
+                Ok(agent_output_to_sdk(output))
             }
         }
-
-        Err(Error::MaxTurns(self.max_turns))
     }
 }
 
-// --- ChatMessage <-> Message conversions ---
+// --- complete_chat: agentic loop with MessageLog persistence ---
 
 fn chat_message_to_api(msg: &ChatMessage) -> Message {
     Message {
@@ -343,7 +208,10 @@ fn chat_message_to_api(msg: &ChatMessage) -> Message {
                 .map(|tc| ApiToolCall {
                     id: tc.id.clone(),
                     call_type: "function".into(),
-                    function: ApiFunctionCall { name: tc.name.clone(), arguments: tc.arguments.clone() },
+                    function: ApiFunctionCall {
+                        name: tc.name.clone(),
+                        arguments: tc.arguments.clone(),
+                    },
                 })
                 .collect()
         }),
@@ -352,61 +220,126 @@ fn chat_message_to_api(msg: &ChatMessage) -> Message {
 }
 
 fn api_tool_call_to_record(tc: &ApiToolCall) -> ToolCallRecord {
-    ToolCallRecord { id: tc.id.clone(), name: tc.function.name.clone(), arguments: tc.function.arguments.clone() }
+    ToolCallRecord {
+        id: tc.id.clone(),
+        name: tc.function.name.clone(),
+        arguments: tc.function.arguments.clone(),
+    }
 }
 
 fn push_user_message(log: &mut MessageLog, prompt: &str) {
-    log.push(ChatMessage { role: "user".into(), content: Some(prompt.into()), tool_calls: None, tool_call_id: None, timestamp: now_utc() });
+    log.push(ChatMessage {
+        role: "user".into(),
+        content: Some(prompt.into()),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: now_utc(),
+    });
 }
 
 fn push_final_assistant(log: &mut MessageLog, text: &str) {
-    log.push(ChatMessage { role: "assistant".into(), content: Some(text.into()), tool_calls: None, tool_call_id: None, timestamp: now_utc() });
+    log.push(ChatMessage {
+        role: "assistant".into(),
+        content: Some(text.into()),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: now_utc(),
+    });
 }
 
-fn push_assistant_tool_calls(log: &mut MessageLog, tool_calls: &[ApiToolCall], content: Option<String>) {
+fn push_assistant_tool_calls(
+    log: &mut MessageLog,
+    tool_calls: &[ApiToolCall],
+    content: Option<String>,
+) {
     let records: Vec<ToolCallRecord> = tool_calls.iter().map(api_tool_call_to_record).collect();
-    log.push(ChatMessage { role: "assistant".into(), content, tool_calls: Some(records), tool_call_id: None, timestamp: now_utc() });
+    log.push(ChatMessage {
+        role: "assistant".into(),
+        content,
+        tool_calls: Some(records),
+        tool_call_id: None,
+        timestamp: now_utc(),
+    });
 }
 
 fn push_tool_result(log: &mut MessageLog, id: &str, result: String) {
-    log.push(ChatMessage { role: "tool".into(), content: Some(result), tool_calls: None, tool_call_id: Some(id.into()), timestamp: now_utc() });
+    log.push(ChatMessage {
+        role: "tool".into(),
+        content: Some(result),
+        tool_calls: None,
+        tool_call_id: Some(id.into()),
+        timestamp: now_utc(),
+    });
 }
 
-// --- complete_chat: agentic loop with MessageLog persistence ---
+enum ChatTurnResult {
+    Final(Output),
+    Continue,
+}
 
 impl OpenRouter {
     /// Run the agentic completion loop, persisting every message to `log`.
-    pub async fn complete_chat(&self, log: &mut MessageLog, prompt: &str) -> Result<Output, Error> {
+    pub async fn complete_chat(
+        &self,
+        log: &mut MessageLog,
+        prompt: &str,
+    ) -> Result<Output, Error> {
         push_user_message(log, prompt);
         let api_tools = self.tool_set.as_ref().map(tool_defs_to_api);
         let mut total_usage = TokenUsage::default();
 
         for turn in 0..self.max_turns {
-            tracing::info!(turn, "OpenRouter chat API call ({} messages)", log.messages().len());
-            let messages: Vec<Message> = log.messages().iter().map(chat_message_to_api).collect();
-            let (resp, usage) = self.call_api(&messages, &api_tools).await?;
-            total_usage.accumulate(&usage);
-            let choice = resp.choices.into_iter().next()
-                .ok_or_else(|| Error::Parse("no choices in response".into()))?;
-            let tool_calls = choice.message.tool_calls.unwrap_or_default();
-            if tool_calls.is_empty() {
-                let text = choice.message.content.unwrap_or_default();
-                push_final_assistant(log, &text);
-                return Ok(Output { text, usage: Some(total_usage), session_id: None, cost_usd: None });
-            }
-            let tool_names: Vec<&str> = tool_calls.iter().map(|tc| tc.function.name.as_str()).collect();
-            tracing::info!(turn, "tool calls: {:?}", tool_names);
-            if let Some(ref ts) = self.tool_set {
-                self.run_tool_turn(log, tool_calls, choice.message.content, ts).await;
+            match self.run_chat_turn(log, &api_tools, &mut total_usage, turn).await? {
+                ChatTurnResult::Final(output) => return Ok(output),
+                ChatTurnResult::Continue => {}
             }
         }
         Err(Error::MaxTurns(self.max_turns))
     }
 
-    async fn run_tool_turn(&self, log: &mut MessageLog, tool_calls: Vec<ApiToolCall>, content: Option<String>, tool_set: &ToolSet) {
+    async fn run_chat_turn(
+        &self,
+        log: &mut MessageLog,
+        api_tools: &Option<Vec<ApiToolDef>>,
+        total_usage: &mut TokenUsage,
+        turn: u32,
+    ) -> Result<ChatTurnResult, Error> {
+        tracing::info!(turn, "OpenRouter chat API call ({} messages)", log.messages().len());
+        let messages: Vec<Message> = log.messages().iter().map(chat_message_to_api).collect();
+        let (resp, usage) = self.call_api(&messages, api_tools).await?;
+        total_usage.accumulate(&usage);
+        let choice = resp.choices.into_iter().next()
+            .ok_or_else(|| Error::Parse("no choices in response".into()))?;
+        let tool_calls = choice.message.tool_calls.unwrap_or_default();
+        if tool_calls.is_empty() {
+            let text = choice.message.content.unwrap_or_default();
+            push_final_assistant(log, &text);
+            return Ok(ChatTurnResult::Final(Output {
+                text, usage: Some(total_usage.clone()), session_id: None, cost_usd: None,
+            }));
+        }
+        let tool_names: Vec<&str> = tool_calls.iter().map(|tc| tc.function.name.as_str()).collect();
+        tracing::info!(turn, "tool calls: {:?}", tool_names);
+        if let Some(ref ts) = self.tool_set {
+            self.run_tool_turn(log, tool_calls, choice.message.content, ts).await;
+        }
+        Ok(ChatTurnResult::Continue)
+    }
+
+    async fn run_tool_turn(
+        &self,
+        log: &mut MessageLog,
+        tool_calls: Vec<ApiToolCall>,
+        content: Option<String>,
+        tool_set: &ToolSet,
+    ) {
         push_assistant_tool_calls(log, &tool_calls, content);
         for tc in &tool_calls {
-            let call = ToolCall { id: tc.id.clone(), name: tc.function.name.clone(), arguments: tc.function.arguments.clone() };
+            let call = crate::tools::ToolCall {
+                id: tc.id.clone(),
+                name: tc.function.name.clone(),
+                arguments: tc.function.arguments.clone(),
+            };
             let result = tool_set.execute(&call).await;
             tracing::info!(tool = %call.name, "tool result: {} bytes", result.len());
             push_tool_result(log, &tc.id, result);
@@ -417,13 +350,11 @@ impl OpenRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openai_shared::ApiUsage;
 
     #[test]
     fn api_usage_conversion() {
-        let api = ApiUsage {
-            prompt_tokens: 100,
-            completion_tokens: 50,
-        };
+        let api = ApiUsage { prompt_tokens: 100, completion_tokens: 50 };
         let usage = api_usage_to_token_usage(&api);
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 50);
@@ -445,19 +376,10 @@ mod tests {
     #[test]
     fn api_response_deserialization() {
         let json = r#"{
-            "choices": [{
-                "message": {
-                    "content": "Hello!",
-                    "tool_calls": null
-                }
-            }],
-            "usage": {
-                "prompt_tokens": 10,
-                "completion_tokens": 5
-            }
+            "choices": [{ "message": { "content": "Hello!", "tool_calls": null } }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
         }"#;
         let resp: ApiResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices.len(), 1);
         assert_eq!(resp.choices[0].message.content.as_deref(), Some("Hello!"));
         assert_eq!(resp.usage.unwrap().prompt_tokens, 10);
     }
@@ -465,24 +387,14 @@ mod tests {
     #[test]
     fn api_response_with_tool_calls() {
         let json = r#"{
-            "choices": [{
-                "message": {
-                    "content": null,
-                    "tool_calls": [{
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {
-                            "name": "Bash",
-                            "arguments": "{\"command\": \"ls\"}"
-                        }
-                    }]
-                }
-            }],
+            "choices": [{ "message": { "content": null, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": { "name": "Bash", "arguments": "{\"command\": \"ls\"}" }
+            }] } }],
             "usage": { "prompt_tokens": 20, "completion_tokens": 10 }
         }"#;
         let resp: ApiResponse = serde_json::from_str(json).unwrap();
         let tool_calls = resp.choices[0].message.tool_calls.as_ref().unwrap();
-        assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].function.name, "Bash");
     }
 

@@ -1,7 +1,9 @@
+use crate::stream::{EventSink, NullSink, StreamEvent, StreamUsage};
 use crate::{Backend, Error, Output, TokenUsage};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
 /// Claude CLI backend with builder-pattern configuration.
@@ -172,7 +174,7 @@ impl Claude {
         if !self.stdin_prompt {
             cmd.arg(prompt);
         }
-        cmd.arg("--output-format").arg("json");
+        cmd.arg("--output-format").arg("stream-json");
         self.apply_flags(&mut cmd);
         self.apply_io(&mut cmd);
         cmd
@@ -241,28 +243,44 @@ impl Claude {
     }
 }
 
-#[async_trait::async_trait]
-impl Backend for Claude {
-    async fn complete(&self, prompt: &str) -> Result<Output, Error> {
+impl Claude {
+    /// Run a completion with an event sink that receives each streaming event.
+    pub async fn complete_streaming(
+        &self,
+        prompt: &str,
+        sink: &mut dyn EventSink,
+    ) -> Result<Output, Error> {
         let cmd = self.build_command(prompt);
-        execute(cmd, self.stdin_prompt, prompt, self.timeout).await
+        execute_streaming(cmd, self.stdin_prompt, prompt, self.timeout, sink).await
     }
 }
 
-async fn execute(
+#[async_trait::async_trait]
+impl Backend for Claude {
+    async fn complete(&self, prompt: &str) -> Result<Output, Error> {
+        self.complete_streaming(prompt, &mut NullSink).await
+    }
+}
+
+async fn execute_streaming(
     mut cmd: Command,
     stdin_prompt: bool,
     prompt: &str,
     timeout: Option<Duration>,
+    sink: &mut dyn EventSink,
 ) -> Result<Output, Error> {
-    tracing::debug!("spawning claude process");
+    tracing::debug!("spawning claude process (stream-json)");
     let mut child = cmd.spawn().map_err(Error::Spawn)?;
     if stdin_prompt {
         write_stdin(&mut child, prompt).await?;
     }
-    let output = wait_with_timeout(child, timeout).await?;
-    check_exit_status(&output)?;
-    Ok(parse_output(&output.stdout))
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::Spawn(std::io::Error::other("no stdout")))?;
+    let result = read_stream_events(stdout, timeout, sink).await;
+    let _ = child.wait().await;
+    result
 }
 
 async fn write_stdin(child: &mut tokio::process::Child, prompt: &str) -> Result<(), Error> {
@@ -276,171 +294,209 @@ async fn write_stdin(child: &mut tokio::process::Child, prompt: &str) -> Result<
     Ok(())
 }
 
-async fn wait_with_timeout(
-    child: tokio::process::Child,
+type StdoutLines = tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>;
+
+async fn read_stream_events(
+    stdout: tokio::process::ChildStdout,
     timeout: Option<Duration>,
-) -> Result<std::process::Output, Error> {
-    match timeout {
-        Some(d) => tokio::time::timeout(d, child.wait_with_output())
+    sink: &mut dyn EventSink,
+) -> Result<Output, Error> {
+    let reader = tokio::io::BufReader::new(stdout);
+    let mut lines = reader.lines();
+    let deadline = timeout.map(|d| tokio::time::Instant::now() + d);
+
+    loop {
+        let line = next_line(&mut lines, deadline).await?;
+        if let Some(output) = process_stream_line(line, sink)? {
+            return Ok(output);
+        }
+    }
+}
+
+fn process_stream_line(
+    line: Option<String>,
+    sink: &mut dyn EventSink,
+) -> Result<Option<Output>, Error> {
+    let Some(line) = line else {
+        return Err(Error::Parse("process closed stdout without result".into()));
+    };
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let Some(event) = parse_stream_line(trimmed) else {
+        return Ok(None);
+    };
+    sink.on_event(trimmed, &event);
+    match into_output(event) {
+        Some(r) => r.map(Some),
+        None => Ok(None),
+    }
+}
+
+async fn next_line(
+    lines: &mut StdoutLines,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<Option<String>, Error> {
+    match deadline {
+        Some(dl) => tokio::time::timeout_at(dl, lines.next_line())
             .await
             .map_err(|_| Error::Timeout)?
             .map_err(Error::Spawn),
-        None => child.wait_with_output().await.map_err(Error::Spawn),
+        None => lines.next_line().await.map_err(Error::Spawn),
     }
 }
 
-fn check_exit_status(output: &std::process::Output) -> Result<(), Error> {
-    if output.status.success() {
-        return Ok(());
+fn parse_stream_line(trimmed: &str) -> Option<StreamEvent> {
+    match serde_json::from_str(trimmed) {
+        Ok(e) => Some(e),
+        Err(_) => {
+            tracing::trace!("skipping unparseable line: {}", &trimmed[..trimmed.len().min(200)]);
+            None
+        }
     }
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    if stderr.contains("No conversation found") {
+}
+
+fn into_output(event: StreamEvent) -> Option<Result<Output, Error>> {
+    let StreamEvent::Result { result, session_id, is_error, total_cost_usd, usage } = event else {
+        return None;
+    };
+    if is_error {
+        return Some(result_error(result));
+    }
+    Some(Ok(Output {
+        text: result.unwrap_or_default(),
+        usage: usage.map(convert_usage),
+        session_id,
+        cost_usd: total_cost_usd,
+    }))
+}
+
+fn result_error(result: Option<String>) -> Result<Output, Error> {
+    let msg = result.unwrap_or_default();
+    if msg.contains("No conversation found") {
         return Err(Error::SessionExpired);
     }
-    Err(Error::ExitStatus {
-        code: output.status.code().unwrap_or(-1),
-        stderr,
-    })
+    Err(Error::ExitStatus { code: 1, stderr: msg })
 }
 
-pub(crate) fn parse_output(stdout: &[u8]) -> Output {
-    let raw = String::from_utf8_lossy(stdout);
-    if let Some(output) = try_parse_array(&raw) {
-        return output;
-    }
-    if let Some(output) = try_parse_object(&raw) {
-        return output;
-    }
-    Output {
-        text: raw.into_owned(),
-        usage: None,
-        session_id: None,
-        cost_usd: None,
-    }
-}
-
-fn try_parse_array(raw: &str) -> Option<Output> {
-    let arr: Vec<serde_json::Value> = serde_json::from_str(raw).ok()?;
-    let entry = arr
-        .iter()
-        .find(|v| v.get("type").and_then(|t| t.as_str()) == Some("result"))?;
-    Some(extract_output(entry))
-}
-
-fn try_parse_object(raw: &str) -> Option<Output> {
-    let val: serde_json::Value = serde_json::from_str(raw).ok()?;
-    val.get("result")?;
-    Some(extract_output(&val))
-}
-
-fn extract_output(val: &serde_json::Value) -> Output {
-    let text = val
-        .get("result")
-        .and_then(|r| r.as_str())
-        .unwrap_or("")
-        .to_string();
-    let usage = val.get("usage").map(extract_usage);
-    let session_id = val
-        .get("session_id")
-        .and_then(|s| s.as_str())
-        .map(String::from);
-    let cost_usd = val.get("cost_usd").and_then(|c| c.as_f64());
-    Output {
-        text,
-        usage,
-        session_id,
-        cost_usd,
-    }
-}
-
-fn extract_usage(u: &serde_json::Value) -> TokenUsage {
+fn convert_usage(u: StreamUsage) -> TokenUsage {
     TokenUsage {
-        input_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-        output_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-        cache_read_input_tokens: u
-            .get("cache_read_input_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        cache_creation_input_tokens: u
-            .get("cache_creation_input_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
+        input_tokens: u.input_tokens,
+        output_tokens: u.output_tokens,
+        cache_read_input_tokens: u.cache_read_input_tokens,
+        cache_creation_input_tokens: u.cache_creation_input_tokens,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream::StreamEvent;
 
     #[test]
-    fn output_from_array_format() {
-        let json = r#"[
-            {"type": "system", "data": "init"},
-            {"type": "result", "result": "hello world", "usage": {
-                "input_tokens": 100,
-                "output_tokens": 50,
-                "cache_read_input_tokens": 10,
-                "cache_creation_input_tokens": 5
-            }, "session_id": "abc-123"}
-        ]"#;
-        let output = parse_output(json.as_bytes());
+    fn into_output_from_result_event() {
+        let event = StreamEvent::Result {
+            result: Some("hello world".into()),
+            session_id: Some("abc-123".into()),
+            is_error: false,
+            total_cost_usd: Some(0.05),
+            usage: Some(StreamUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_input_tokens: 10,
+                cache_creation_input_tokens: 5,
+            }),
+        };
+        let output = into_output(event).unwrap().unwrap();
         assert_eq!(output.text, "hello world");
+        assert_eq!(output.session_id.as_deref(), Some("abc-123"));
+        assert_eq!(output.cost_usd, Some(0.05));
         let usage = output.usage.unwrap();
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 50);
         assert_eq!(usage.cache_read_input_tokens, 10);
         assert_eq!(usage.cache_creation_input_tokens, 5);
-        assert_eq!(output.session_id.as_deref(), Some("abc-123"));
     }
 
     #[test]
-    fn output_from_single_object() {
-        let json = r#"{"result": "response text", "usage": {
-            "input_tokens": 200, "output_tokens": 100,
-            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0
-        }}"#;
-        let output = parse_output(json.as_bytes());
-        assert_eq!(output.text, "response text");
-        let usage = output.usage.unwrap();
-        assert_eq!(usage.input_tokens, 200);
-        assert_eq!(usage.output_tokens, 100);
+    fn into_output_none_for_non_result() {
+        let event = StreamEvent::System { session_id: None, subtype: Some("init".into()) };
+        assert!(into_output(event).is_none());
     }
 
     #[test]
-    fn output_from_raw_text() {
-        let output = parse_output(b"not json at all");
-        assert_eq!(output.text, "not json at all");
-        assert!(output.usage.is_none());
-        assert!(output.session_id.is_none());
+    fn into_output_error_result() {
+        let event = StreamEvent::Result {
+            result: Some("something failed".into()),
+            session_id: None,
+            is_error: true,
+            total_cost_usd: None,
+            usage: None,
+        };
+        let err = into_output(event).unwrap().unwrap_err();
+        assert!(err.to_string().contains("something failed"));
     }
 
     #[test]
-    fn output_array_without_result_entry() {
-        let json = r#"[{"type": "system"}, {"type": "assistant"}]"#;
-        let output = parse_output(json.as_bytes());
-        assert!(output.text.contains("system"));
+    fn into_output_session_expired() {
+        let event = StreamEvent::Result {
+            result: Some("No conversation found".into()),
+            session_id: None,
+            is_error: true,
+            total_cost_usd: None,
+            usage: None,
+        };
+        let err = into_output(event).unwrap().unwrap_err();
+        assert!(matches!(err, Error::SessionExpired));
     }
 
     #[test]
-    fn output_object_without_result_field() {
-        let json = r#"{"error": "something went wrong"}"#;
-        let output = parse_output(json.as_bytes());
-        assert!(output.text.contains("something went wrong"));
+    fn parse_stream_line_valid() {
+        let json = r#"{"type":"system","session_id":"abc","subtype":"init"}"#;
+        let event = parse_stream_line(json).unwrap();
+        assert!(matches!(event, StreamEvent::System { .. }));
     }
 
     #[test]
-    fn output_missing_usage() {
-        let json = r#"{"result": "no usage"}"#;
-        let output = parse_output(json.as_bytes());
-        assert_eq!(output.text, "no usage");
-        assert!(output.usage.is_none());
+    fn parse_stream_line_invalid() {
+        assert!(parse_stream_line("not json").is_none());
     }
 
     #[test]
-    fn output_with_cost() {
-        let json = r#"{"result": "ok", "cost_usd": 0.05}"#;
-        let output = parse_output(json.as_bytes());
-        assert_eq!(output.cost_usd, Some(0.05));
+    fn parse_stream_line_unknown_type() {
+        let json = r#"{"type":"rate_limit_event","data":"something"}"#;
+        let event = parse_stream_line(json).unwrap();
+        assert!(matches!(event, StreamEvent::Other));
+    }
+
+    #[test]
+    fn process_stream_line_eof() {
+        let err = process_stream_line(None, &mut NullSink).unwrap_err();
+        assert!(err.to_string().contains("without result"));
+    }
+
+    #[test]
+    fn process_stream_line_empty() {
+        let result = process_stream_line(Some("  ".into()), &mut NullSink).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn process_stream_line_result() {
+        let json = r#"{"type":"result","subtype":"success","result":"done","is_error":false}"#;
+        let output = process_stream_line(Some(json.into()), &mut NullSink)
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.text, "done");
+    }
+
+    #[test]
+    fn build_command_uses_stream_json() {
+        let claude = Claude::with_binary(PathBuf::from("/usr/bin/claude"));
+        let cmd = claude.build_command("hello");
+        let args: Vec<_> = cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        assert!(args.contains(&"stream-json".to_string()));
     }
 
     #[test]

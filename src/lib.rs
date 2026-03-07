@@ -1,8 +1,11 @@
 pub mod claude;
 pub mod message_log;
+pub mod openai;
+mod openai_shared;
 pub mod openrouter;
 pub mod sandbox;
 pub mod session;
+pub mod stream;
 pub mod tools;
 
 pub use message_log::{ChatMessage, MessageLog, ToolCallRecord};
@@ -15,6 +18,7 @@ pub trait Backend: Send + Sync {
 }
 
 /// Result of a model completion.
+#[derive(Debug)]
 pub struct Output {
     pub text: String,
     pub usage: Option<TokenUsage>,
