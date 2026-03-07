@@ -1,4 +1,5 @@
 pub mod claude;
+pub mod codex;
 pub mod message_log;
 pub mod openai;
 mod openai_shared;
