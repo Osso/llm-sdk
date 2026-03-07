@@ -1,7 +1,5 @@
 use crate::openai_shared::{
-    agent_msg_to_api, agent_output_to_sdk, api_usage_to_token_usage, build_agent_loop,
-    parse_chat_response, tools_json_from_tool_set, ApiRequest, ApiResponse, ApiToolDef, Message,
-    NoOpExecutor, ToolSetExecutor,
+    agent_output_to_sdk, build_agent_loop, tools_json_from_tool_set, NoOpExecutor, ToolSetExecutor,
 };
 use crate::tools::ToolSet;
 use crate::{Backend, Error, Output, TokenUsage};
@@ -13,6 +11,84 @@ const API_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_MODEL: &str = "gpt-5.4";
+const DEFAULT_INSTRUCTIONS: &str = "You are a helpful coding assistant.";
+
+// --- Responses API types ---
+
+#[derive(Serialize)]
+struct ResponsesRequest {
+    model: String,
+    instructions: String,
+    input: Vec<InputItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ResponsesToolDef>>,
+    store: bool,
+    stream: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+enum InputItem {
+    #[serde(rename = "message")]
+    Message { role: String, content: String },
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput { call_id: String, output: String },
+}
+
+#[derive(Serialize, Clone)]
+struct ResponsesToolDef {
+    #[serde(rename = "type")]
+    tool_type: String,
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct ResponsesApiResponse {
+    #[serde(default)]
+    output: Vec<OutputItem>,
+    #[serde(default)]
+    usage: Option<ResponsesUsage>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+enum OutputItem {
+    #[serde(rename = "message")]
+    Message {
+        content: Vec<ContentPart>,
+    },
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+enum ContentPart {
+    #[serde(rename = "output_text")]
+    OutputText { text: String },
+}
+
+#[derive(Deserialize)]
+struct ResponsesUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+}
+
+// --- Auth types ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AuthFile {
@@ -193,21 +269,157 @@ fn write_file_0600(path: &std::path::Path, content: &str) -> Result<(), Error> {
     Ok(())
 }
 
+// --- SSE parsing ---
+
+async fn parse_sse_response(resp: reqwest::Response) -> Result<ResponsesApiResponse, Error> {
+    let body = resp.text().await.map_err(|e| Error::Parse(e.to_string()))?;
+    for line in body.lines() {
+        let line = line.trim();
+        if !line.starts_with("data: ") {
+            continue;
+        }
+        let data = &line[6..];
+        if let Some(parsed) = try_parse_completed(data) {
+            return Ok(parsed);
+        }
+    }
+    Err(Error::Parse("no response.completed event in SSE stream".into()))
+}
+
+fn try_parse_completed(data: &str) -> Option<ResponsesApiResponse> {
+    let v: serde_json::Value = serde_json::from_str(data).ok()?;
+    if v.get("type")?.as_str()? != "response.completed" {
+        return None;
+    }
+    let response = v.get("response")?;
+    serde_json::from_value(response.clone()).ok()
+}
+
+// --- Conversions: ChatMessage <-> Responses API ---
+
+fn extract_instructions(messages: &[llm_agent::ChatMessage]) -> String {
+    messages
+        .iter()
+        .find(|m| m.role == "system")
+        .and_then(|m| m.content.clone())
+        .unwrap_or_else(|| DEFAULT_INSTRUCTIONS.to_string())
+}
+
+fn chat_message_to_input(msg: &llm_agent::ChatMessage) -> Vec<InputItem> {
+    match msg.role.as_str() {
+        "system" => vec![],
+        "user" => {
+            let content = msg.content.clone().unwrap_or_default();
+            vec![InputItem::Message { role: "user".into(), content }]
+        }
+        "assistant" => assistant_msg_to_input(msg),
+        "tool" => {
+            let call_id = msg.tool_call_id.clone().unwrap_or_default();
+            let output = msg.content.clone().unwrap_or_default();
+            vec![InputItem::FunctionCallOutput { call_id, output }]
+        }
+        _ => vec![],
+    }
+}
+
+fn assistant_msg_to_input(msg: &llm_agent::ChatMessage) -> Vec<InputItem> {
+    let mut items = Vec::new();
+    if let Some(ref text) = msg.content {
+        if !text.is_empty() {
+            items.push(InputItem::Message {
+                role: "assistant".into(),
+                content: text.clone(),
+            });
+        }
+    }
+    if let Some(ref tcs) = msg.tool_calls {
+        for tc in tcs {
+            items.push(InputItem::FunctionCall {
+                call_id: tc.id.clone(),
+                name: tc.function.name.clone(),
+                arguments: tc.function.arguments.clone(),
+            });
+        }
+    }
+    items
+}
+
+fn tools_from_chat_json(tools: Option<&serde_json::Value>) -> Option<Vec<ResponsesToolDef>> {
+    let arr = tools?.as_array()?;
+    let defs: Vec<ResponsesToolDef> = arr
+        .iter()
+        .filter_map(chat_tool_json_to_responses)
+        .collect();
+    if defs.is_empty() { None } else { Some(defs) }
+}
+
+/// Convert a Chat Completions tool JSON to Responses API format.
+fn chat_tool_json_to_responses(v: &serde_json::Value) -> Option<ResponsesToolDef> {
+    let func = v.get("function")?;
+    Some(ResponsesToolDef {
+        tool_type: "function".into(),
+        name: func.get("name")?.as_str()?.to_string(),
+        description: func.get("description")?.as_str()?.to_string(),
+        parameters: func.get("parameters").cloned().unwrap_or(serde_json::json!({})),
+    })
+}
+
+fn responses_usage_to_token_usage(u: &ResponsesUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: u.input_tokens,
+        output_tokens: u.output_tokens,
+        ..Default::default()
+    }
+}
+
+fn output_items_to_parts(items: &[OutputItem]) -> Vec<llm_agent::Part> {
+    items.iter().flat_map(output_item_to_parts).collect()
+}
+
+fn output_item_to_parts(item: &OutputItem) -> Vec<llm_agent::Part> {
+    match item {
+        OutputItem::Message { content } => {
+            content
+                .iter()
+                .map(|c| match c {
+                    ContentPart::OutputText { text } => llm_agent::Part::Text(text.clone()),
+                })
+                .collect()
+        }
+        OutputItem::FunctionCall { call_id, name, arguments } => {
+            vec![llm_agent::Part::ToolUse(llm_agent::ToolCall {
+                id: call_id.clone(),
+                call_type: "function".into(),
+                function: llm_agent::FunctionCall {
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                },
+            })]
+        }
+    }
+}
+
+fn has_tool_calls(items: &[OutputItem]) -> bool {
+    items.iter().any(|i| matches!(i, OutputItem::FunctionCall { .. }))
+}
+
 // --- HTTP transport ---
 
 impl Codex {
     fn build_request(
         &self,
-        messages: &[Message],
-        tools: &Option<Vec<ApiToolDef>>,
+        instructions: &str,
+        input: &[InputItem],
+        tools: &Option<Vec<ResponsesToolDef>>,
         tokens: &AuthTokens,
     ) -> reqwest::RequestBuilder {
-        let body = ApiRequest {
+        let body = ResponsesRequest {
             model: self.model.clone(),
-            messages: messages.to_vec(),
-            tools: tools
-                .as_ref()
-                .and_then(|t| if t.is_empty() { None } else { Some(t.clone()) }),
+            instructions: instructions.to_string(),
+            input: input.to_vec(),
+            tools: tools.clone(),
+            store: false,
+            stream: true,
         };
         self.client
             .post(API_URL)
@@ -238,20 +450,18 @@ impl Codex {
 
     async fn call_api(
         &self,
-        messages: &[Message],
-        tools: &Option<Vec<ApiToolDef>>,
-    ) -> Result<(ApiResponse, TokenUsage), Error> {
+        instructions: &str,
+        input: &[InputItem],
+        tools: &Option<Vec<ResponsesToolDef>>,
+    ) -> Result<(ResponsesApiResponse, TokenUsage), Error> {
         let tokens = self.ensure_tokens().await?;
-        let req = self.build_request(messages, tools, &tokens);
+        let req = self.build_request(instructions, input, tools, &tokens);
         let resp = self.send_request(req).await?;
-        let api_resp: ApiResponse = resp
-            .json()
-            .await
-            .map_err(|e| Error::Parse(e.to_string()))?;
+        let api_resp = parse_sse_response(resp).await?;
         let usage = api_resp
             .usage
             .as_ref()
-            .map(api_usage_to_token_usage)
+            .map(responses_usage_to_token_usage)
             .unwrap_or_default();
         Ok((api_resp, usage))
     }
@@ -267,11 +477,25 @@ impl llm_agent::ChatClient for Codex {
         tools: Option<&serde_json::Value>,
     ) -> Result<(llm_agent::Response, llm_agent::Usage), Box<dyn std::error::Error + Send + Sync>>
     {
-        let api_messages: Vec<Message> = messages.iter().map(agent_msg_to_api).collect();
-        let api_tools: Option<Vec<ApiToolDef>> =
-            tools.and_then(|v| serde_json::from_value(v.clone()).ok());
-        let (resp, usage) = self.call_api(&api_messages, &api_tools).await?;
-        parse_chat_response(resp, usage)
+        let instructions = extract_instructions(messages);
+        let input: Vec<InputItem> = messages.iter().flat_map(chat_message_to_input).collect();
+        let api_tools = tools_from_chat_json(tools);
+        let (resp, usage) = self.call_api(&instructions, &input, &api_tools).await?;
+        let parts = output_items_to_parts(&resp.output);
+        let finish_reason = if has_tool_calls(&resp.output) {
+            "tool_calls"
+        } else {
+            "stop"
+        };
+        let agent_usage = llm_agent::Usage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            reasoning_tokens: 0,
+        };
+        Ok((
+            llm_agent::Response { parts, finish_reason: finish_reason.to_string() },
+            agent_usage,
+        ))
     }
 }
 
@@ -367,5 +591,151 @@ mod tests {
             ..tokens
         };
         assert!(!is_expired(&future_tokens));
+    }
+
+    #[test]
+    fn extract_instructions_from_messages() {
+        let msgs = vec![
+            llm_agent::ChatMessage {
+                role: "system".into(),
+                content: Some("Custom instructions".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            llm_agent::ChatMessage {
+                role: "user".into(),
+                content: Some("hello".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        assert_eq!(extract_instructions(&msgs), "Custom instructions");
+    }
+
+    #[test]
+    fn extract_instructions_default() {
+        let msgs = vec![llm_agent::ChatMessage {
+            role: "user".into(),
+            content: Some("hello".into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        assert_eq!(extract_instructions(&msgs), DEFAULT_INSTRUCTIONS);
+    }
+
+    #[test]
+    fn chat_message_to_input_user() {
+        let msg = llm_agent::ChatMessage {
+            role: "user".into(),
+            content: Some("hi".into()),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let items = chat_message_to_input(&msg);
+        assert_eq!(items.len(), 1);
+        let json = serde_json::to_value(&items[0]).unwrap();
+        assert_eq!(json["type"], "message");
+        assert_eq!(json["role"], "user");
+        assert_eq!(json["content"], "hi");
+    }
+
+    #[test]
+    fn chat_message_to_input_tool_result() {
+        let msg = llm_agent::ChatMessage {
+            role: "tool".into(),
+            content: Some("result text".into()),
+            tool_calls: None,
+            tool_call_id: Some("call_123".into()),
+        };
+        let items = chat_message_to_input(&msg);
+        assert_eq!(items.len(), 1);
+        let json = serde_json::to_value(&items[0]).unwrap();
+        assert_eq!(json["type"], "function_call_output");
+        assert_eq!(json["call_id"], "call_123");
+        assert_eq!(json["output"], "result text");
+    }
+
+    #[test]
+    fn chat_message_to_input_assistant_with_tool_calls() {
+        let msg = llm_agent::ChatMessage {
+            role: "assistant".into(),
+            content: Some("thinking...".into()),
+            tool_calls: Some(vec![llm_agent::ToolCall {
+                id: "call_abc".into(),
+                call_type: "function".into(),
+                function: llm_agent::FunctionCall {
+                    name: "Bash".into(),
+                    arguments: r#"{"command":"ls"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+        };
+        let items = chat_message_to_input(&msg);
+        assert_eq!(items.len(), 2);
+        let json0 = serde_json::to_value(&items[0]).unwrap();
+        assert_eq!(json0["type"], "message");
+        assert_eq!(json0["content"], "thinking...");
+        let json1 = serde_json::to_value(&items[1]).unwrap();
+        assert_eq!(json1["type"], "function_call");
+        assert_eq!(json1["call_id"], "call_abc");
+        assert_eq!(json1["name"], "Bash");
+    }
+
+    #[test]
+    fn chat_message_system_skipped() {
+        let msg = llm_agent::ChatMessage {
+            role: "system".into(),
+            content: Some("system prompt".into()),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let items = chat_message_to_input(&msg);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn tools_from_chat_json_conversion() {
+        let chat_tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "Bash",
+                "description": "Run a command",
+                "parameters": {"type": "object"}
+            }
+        }]);
+        let defs = tools_from_chat_json(Some(&chat_tools)).unwrap();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "Bash");
+        assert_eq!(defs[0].description, "Run a command");
+        assert_eq!(defs[0].tool_type, "function");
+    }
+
+    #[test]
+    fn output_item_text_to_parts() {
+        let items = vec![OutputItem::Message {
+            content: vec![ContentPart::OutputText { text: "Hello".into() }],
+        }];
+        let parts = output_items_to_parts(&items);
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(&parts[0], llm_agent::Part::Text(t) if t == "Hello"));
+    }
+
+    #[test]
+    fn output_item_function_call_to_parts() {
+        let items = vec![OutputItem::FunctionCall {
+            call_id: "call_1".into(),
+            name: "Bash".into(),
+            arguments: r#"{"cmd":"ls"}"#.into(),
+        }];
+        let parts = output_items_to_parts(&items);
+        assert_eq!(parts.len(), 1);
+        match &parts[0] {
+            llm_agent::Part::ToolUse(tc) => {
+                assert_eq!(tc.id, "call_1");
+                assert_eq!(tc.function.name, "Bash");
+            }
+            _ => panic!("expected ToolUse"),
+        }
+        assert!(has_tool_calls(&items));
     }
 }
