@@ -10,7 +10,6 @@ use std::time::Duration;
 const API_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const DEFAULT_MODEL: &str = "gpt-5.4";
 const DEFAULT_INSTRUCTIONS: &str = "You are a helpful coding assistant.";
 
 // --- Responses API types ---
@@ -539,8 +538,8 @@ mod tests {
 
     #[test]
     fn builder_defaults() {
-        let c = Codex::new(DEFAULT_MODEL);
-        assert_eq!(c.model, DEFAULT_MODEL);
+        let c = Codex::new("gpt-5.4");
+        assert_eq!(c.model, "gpt-5.4");
         assert_eq!(c.max_turns, 20);
         assert!(c.system_prompt.is_none());
         assert!(c.tool_set.is_none());
