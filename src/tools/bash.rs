@@ -17,6 +17,12 @@ impl BashTool {
         }
     }
 
+    /// Set the working directory for bash commands.
+    pub fn with_working_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.working_dir = Some(dir.into());
+        self
+    }
+
     /// Prepend a command prefix (e.g. bwrap sandbox args) before bash.
     pub fn with_command_prefix(mut self, prefix: Vec<String>) -> Self {
         self.command_prefix = prefix;

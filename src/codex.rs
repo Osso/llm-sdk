@@ -500,34 +500,28 @@ impl llm_agent::ChatClient for Codex {
 
 // --- Backend impl using AgentLoop ---
 
+async fn run_agent<C: llm_agent::ChatClient, T: llm_agent::ToolExecutor>(
+    c: &C, ex: T, turns: u32, sp: Option<&str>,
+    tj: Option<serde_json::Value>, obs: impl llm_agent::TurnObserver, prompt: &str,
+) -> Result<Output, Error> {
+    let agent = build_agent_loop(c, ex, turns, sp, tj).with_observer(obs);
+    agent.run(prompt).await.map(agent_output_to_sdk).map_err(|e| Error::Parse(e.to_string()))
+}
+
 #[async_trait::async_trait]
 impl Backend for Codex {
     async fn complete(&self, prompt: &str) -> Result<Output, Error> {
-        let tools_json = self.tool_set.as_ref().map(tools_json_from_tool_set);
-        match &self.tool_set {
-            Some(ts) => {
-                let executor = ToolSetExecutor { tool_set: ts };
-                let agent = build_agent_loop(
-                    self, executor, self.max_turns,
-                    self.system_prompt.as_deref(), tools_json,
-                );
-                let output = agent
-                    .run(prompt)
-                    .await
-                    .map_err(|e| Error::Parse(e.to_string()))?;
-                Ok(agent_output_to_sdk(output))
-            }
-            None => {
-                let agent = build_agent_loop(
-                    self, NoOpExecutor, 1,
-                    self.system_prompt.as_deref(), None,
-                );
-                let output = agent
-                    .run(prompt)
-                    .await
-                    .map_err(|e| Error::Parse(e.to_string()))?;
-                Ok(agent_output_to_sdk(output))
-            }
+        self.complete_observed(prompt, llm_agent::NoObserver).await
+    }
+}
+
+impl Codex {
+    pub async fn complete_observed(&self, prompt: &str, obs: impl llm_agent::TurnObserver) -> Result<Output, Error> {
+        let tj = self.tool_set.as_ref().map(tools_json_from_tool_set);
+        if let Some(ts) = &self.tool_set {
+            run_agent(self, ToolSetExecutor { tool_set: ts }, self.max_turns, self.system_prompt.as_deref(), tj, obs, prompt).await
+        } else {
+            run_agent(self, NoOpExecutor, 1, self.system_prompt.as_deref(), None, obs, prompt).await
         }
     }
 }

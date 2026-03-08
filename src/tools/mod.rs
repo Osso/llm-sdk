@@ -58,6 +58,16 @@ impl ToolSet {
             .add(bash::BashTool::new())
     }
 
+    /// Standard set with Bash working directory set.
+    pub fn standard_with_cwd(cwd: impl Into<std::path::PathBuf>) -> Self {
+        Self::new()
+            .add(read::ReadTool)
+            .add(write::WriteTool)
+            .add(glob::GlobTool)
+            .add(grep::GrepTool)
+            .add(bash::BashTool::new().with_working_dir(cwd))
+    }
+
     /// Standard set with Bash sandboxed via a command prefix (e.g. bwrap).
     pub fn standard_sandboxed(command_prefix: Vec<String>) -> Self {
         Self::new()

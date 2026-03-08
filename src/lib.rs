@@ -12,6 +12,10 @@ pub mod tools;
 pub use message_log::{ChatMessage, MessageLog, ToolCallRecord};
 pub use session::{LogEntry, LogUsage};
 
+// Re-export agent loop types used by orchestrator for per-turn observation.
+pub use llm_agent::{NoObserver, TurnObserver};
+pub use llm_agent::{Response as AgentResponse, Usage as AgentUsage};
+
 /// Backend trait for language model completions.
 #[async_trait::async_trait]
 pub trait Backend: Send + Sync {
