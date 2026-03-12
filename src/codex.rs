@@ -89,20 +89,31 @@ struct ResponsesUsage {
 
 // --- Auth types ---
 
+/// Codex auth.json format (~/.codex/llm-mcp-auth.json)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AuthFile {
-    openai: Option<AuthTokens>,
+    tokens: Option<AuthFileTokens>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuthFileTokens {
+    access_token: String,
+    refresh_token: String,
+    account_id: String,
+    #[serde(default)]
+    expires: u64,
+    #[serde(default)]
+    id_token: Option<String>,
+}
+
+/// Internal token representation with expiry tracking
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AuthTokens {
     refresh: String,
     access: String,
     expires: u64,
-    #[serde(rename = "accountId")]
     account_id: String,
-    #[serde(rename = "type")]
-    auth_type: Option<String>,
+    id_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -110,6 +121,7 @@ struct RefreshResponse {
     access_token: String,
     refresh_token: String,
     expires_in: u64,
+    id_token: Option<String>,
 }
 
 pub struct Codex {
@@ -125,9 +137,9 @@ pub struct Codex {
 
 impl Codex {
     pub fn new(model: impl Into<String>) -> Self {
-        let auth_path = dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("~/.local/share"))
-            .join("opencode/auth.json");
+        let auth_path = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(".codex/llm-mcp-auth.json");
         Self {
             client: reqwest::Client::new(),
             model: model.into(),
@@ -174,17 +186,29 @@ impl Codex {
             .map_err(|e| Error::Parse(format!("cannot read auth.json: {e}")))?;
         let auth_file: AuthFile = serde_json::from_str(&data)
             .map_err(|e| Error::Parse(format!("invalid auth.json: {e}")))?;
-        auth_file
-            .openai
-            .ok_or_else(|| Error::Parse("missing 'openai' key in auth.json".into()))
+        let t = auth_file
+            .tokens
+            .ok_or_else(|| Error::Parse("missing 'tokens' key in auth.json".into()))?;
+        Ok(AuthTokens {
+            refresh: t.refresh_token,
+            access: t.access_token,
+            expires: t.expires,
+            account_id: t.account_id,
+            id_token: t.id_token,
+        })
     }
 
     fn write_auth_file(&self, tokens: &AuthTokens) -> Result<(), Error> {
         let data = std::fs::read_to_string(&self.auth_path).unwrap_or_default();
         let mut auth_file: serde_json::Value =
             serde_json::from_str(&data).unwrap_or(serde_json::json!({}));
-        auth_file["openai"] = serde_json::to_value(tokens)
-            .map_err(|e| Error::Parse(format!("serialize tokens: {e}")))?;
+        auth_file["tokens"] = serde_json::json!({
+            "access_token": tokens.access,
+            "refresh_token": tokens.refresh,
+            "account_id": tokens.account_id,
+            "expires": tokens.expires,
+            "id_token": tokens.id_token,
+        });
         let json = serde_json::to_string_pretty(&auth_file)
             .map_err(|e| Error::Parse(format!("serialize auth file: {e}")))?;
         write_file_0600(&self.auth_path, &json)
@@ -208,7 +232,7 @@ impl Codex {
 
     async fn refresh_tokens(&self, tokens: &AuthTokens) -> Result<AuthTokens, Error> {
         let body = format!(
-            "grant_type=refresh_token&refresh_token={}&client_id={CLIENT_ID}",
+            "grant_type=refresh_token&refresh_token={}&client_id={CLIENT_ID}&scope=openid",
             tokens.refresh
         );
         let resp = self
@@ -233,7 +257,7 @@ impl Codex {
             access: r.access_token,
             expires: now_millis() + r.expires_in * 1000,
             account_id: tokens.account_id.clone(),
-            auth_type: tokens.auth_type.clone(),
+            id_token: r.id_token,
         })
     }
 }
@@ -554,17 +578,16 @@ mod tests {
     #[test]
     fn auth_tokens_deserialization() {
         let json = r#"{
-            "openai": {
-                "type": "oauth",
-                "refresh": "rt_test",
-                "access": "eyJ_test",
-                "expires": 1773663691802,
-                "accountId": "fe2de890-test"
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": "eyJ_test",
+                "refresh_token": "rt_test",
+                "account_id": "fe2de890-test"
             }
         }"#;
         let auth: AuthFile = serde_json::from_str(json).unwrap();
-        let tokens = auth.openai.unwrap();
-        assert_eq!(tokens.refresh, "rt_test");
+        let tokens = auth.tokens.unwrap();
+        assert_eq!(tokens.refresh_token, "rt_test");
         assert_eq!(tokens.account_id, "fe2de890-test");
     }
 
@@ -575,7 +598,7 @@ mod tests {
             access: String::new(),
             expires: 0,
             account_id: String::new(),
-            auth_type: None,
+            id_token: None,
         };
         assert!(is_expired(&tokens));
 
@@ -588,32 +611,16 @@ mod tests {
 
     #[test]
     fn extract_instructions_from_messages() {
-        let msgs = vec![
-            llm_agent::ChatMessage {
-                role: "system".into(),
-                content: Some("Custom instructions".into()),
-                tool_calls: None,
-                tool_call_id: None,
-            },
-            llm_agent::ChatMessage {
-                role: "user".into(),
-                content: Some("hello".into()),
-                tool_calls: None,
-                tool_call_id: None,
-            },
-        ];
-        assert_eq!(extract_instructions(&msgs), "Custom instructions");
-    }
-
-    #[test]
-    fn extract_instructions_default() {
-        let msgs = vec![llm_agent::ChatMessage {
-            role: "user".into(),
-            content: Some("hello".into()),
-            tool_calls: None,
-            tool_call_id: None,
-        }];
-        assert_eq!(extract_instructions(&msgs), DEFAULT_INSTRUCTIONS);
+        let system_msg = llm_agent::ChatMessage {
+            role: "system".into(), content: Some("Custom".into()),
+            tool_calls: None, tool_call_id: None,
+        };
+        let user_msg = llm_agent::ChatMessage {
+            role: "user".into(), content: Some("hello".into()),
+            tool_calls: None, tool_call_id: None,
+        };
+        assert_eq!(extract_instructions(&[system_msg, user_msg.clone()]), "Custom");
+        assert_eq!(extract_instructions(&[user_msg]), DEFAULT_INSTRUCTIONS);
     }
 
     #[test]
